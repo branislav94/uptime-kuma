@@ -1,0 +1,7 @@
+# tajne i podaci — NIKAD u git
+.env
+.env.backup-*
+data/
+sync-state/
+__pycache__/
+*.pyc
