@@ -16,9 +16,10 @@ Infrastruktura
 Notifikacije
 - ntfy (aplikacija na telefonu): poseban topic za sajtove i za infrastrukturu
 
-Istek domena
-- RDAP gde postoji, WHOIS za .rs/.io i ostale bez RDAP-a
-- Datum isteka upisuje u opis monitora, šalje ntfy na 30/14/7/3/1 dan
+Istek domena i SSL-a (poseban ntfy topic NTFY_TOPIC_EXPIRY)
+- RDAP gde postoji, WHOIS za .rs/.io i ostale bez RDAP-a; alarm na 30/14/7/3/1 dan
+- SSL sertifikat koji sajt stvarno servira; alarm na 14/7/3/1 dan (= AutoSSL ne obnavlja)
+- Datume upisuje u opis monitora
 
 Pokretanje:
   python kuma_sync.py                  # jedan prolaz
@@ -26,6 +27,7 @@ Pokretanje:
   python kuma_sync.py --loop           # radi na svakih SYNC_INTERVAL sekundi
   python kuma_sync.py --expiry DOMEN   # test: kada ističe domen
   python kuma_sync.py --test-ntfy      # test: pošalji probnu poruku na telefon
+  python kuma_sync.py --ssl DOMEN      # test: kada ističe SSL sertifikat
 """
 import argparse
 import fnmatch
@@ -34,6 +36,8 @@ import json
 import os
 import re
 import socket
+import ssl
+from concurrent.futures import ThreadPoolExecutor
 import sys
 import threading
 import time
@@ -64,6 +68,9 @@ LOCAL_GROUP = "Lokalna veza (Kuma)"
 NTFY_SITES_NAME = "ntfy · sajtovi"
 NTFY_INFRA_NAME = "ntfy · infrastruktura"
 EXPIRY_PREFIX = "Domen ističe:"
+SSL_PREFIX = "SSL"
+# opis monitora koji počinje ovim je pisao sync (sme da ga menja)
+SYNC_DESC_PREFIXES = (EXPIRY_PREFIX, "SSL ističe:", "SSL:")
 
 STATE_DIR = os.environ.get("STATE_DIR", "/app/state")
 
@@ -116,6 +123,11 @@ def save_state(name, data):
 
 def ntfy_server():
     return env("NTFY_SERVER", "https://ntfy.sh").rstrip("/")
+
+
+def expiry_topic():
+    """Istek domena i SSL-a: poseban topic, ili topic sajtova ako nije podešen."""
+    return env("NTFY_TOPIC_EXPIRY", "") or env("NTFY_TOPIC_SITES", "")
 
 
 def ntfy_send(topic, title, message, priority=3, tags=None):
@@ -410,7 +422,7 @@ def check_expiry(reg_domains):
     state = load_state("expiry.json")
     every = env_int("EXPIRY_CHECK_HOURS", 24) * 3600
     days_list = sorted({int(x) for x in env_list("DOMAIN_EXPIRY_DAYS", "30,14,7,3,1")}, reverse=True)
-    topic = env("NTFY_TOPIC_SITES", "")
+    topic = expiry_topic()
     now = datetime.now(timezone.utc)
     out = {}
     checked = 0
@@ -447,6 +459,69 @@ def check_expiry(reg_domains):
     save_state("expiry.json", state)
     known = sum(1 for v in out.values() if v)
     log(f"istek domena: {known}/{len(out)} poznato (sada proveravano {checked})")
+    return out
+
+
+# ------------------------------------------------------------ SSL ---
+
+def get_cert(domain, port=443):
+    """Vraća (notAfter datetime | None, greška | None) za sertifikat koji sajt stvarno servira."""
+    ctx = ssl.create_default_context()
+    try:
+        with socket.create_connection((domain, port), timeout=10) as sock:
+            with ctx.wrap_socket(sock, server_hostname=domain) as tls:
+                cert = tls.getpeercert()
+        exp = datetime.fromtimestamp(ssl.cert_time_to_seconds(cert["notAfter"]), timezone.utc)
+        return exp, None
+    except ssl.SSLCertVerificationError as e:
+        return None, f"nevažeći sertifikat: {e.verify_message}"
+    except Exception as e:
+        return None, f"{type(e).__name__}: {e}"
+
+
+def check_ssl(domains):
+    """domains: {domen: opis klijenta}. Vraća {domen: (datetime|None, greška|None)}.
+    Alarm kad ostane SSL_EXPIRY_DAYS dana — kod cPanel-a to znači da AutoSSL ne uspeva da obnovi."""
+    state = load_state("ssl.json")
+    every = env_int("EXPIRY_CHECK_HOURS", 24) * 3600
+    days_list = sorted({int(x) for x in env_list("SSL_EXPIRY_DAYS", "14,7,3,1")}, reverse=True)
+    now = datetime.now(timezone.utc)
+
+    todo = [d for d in domains if time.time() - state.get(d, {}).get("checked", 0) > every]
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        for dom, (exp, err) in zip(todo, pool.map(get_cert, todo)):
+            st = state.get(dom, {})
+            new_exp = exp.isoformat() if exp else None
+            if new_exp != st.get("expires"):
+                st["alerted"] = []  # obnovljen
+            st.update({"expires": new_exp, "error": err, "checked": time.time()})
+            state[dom] = st
+            if err:
+                log(f"  SSL {dom}: {err}")
+
+    out = {}
+    for dom, who in domains.items():
+        st = state.get(dom, {})
+        exp = datetime.fromisoformat(st["expires"]) if st.get("expires") else None
+        out[dom] = (exp, st.get("error"))
+        if not exp:
+            continue
+        left = (exp - now).days
+        crossed = [d for d in days_list if left <= d and d not in st.get("alerted", [])]
+        if crossed:
+            title = (f"SSL za {dom} je ISTEKAO" if left < 0
+                     else f"SSL za {dom} ističe za {left} dana")
+            log(f"⚠ {title} ({exp:%d.%m.%Y}) — {who}")
+            ntfy_send(expiry_topic(), title,
+                      f"Datum isteka: {exp:%d.%m.%Y}\nKlijent: {who}\n"
+                      f"AutoSSL verovatno ne uspeva da obnovi — WHM > Manage AutoSSL > Logs",
+                      priority=5 if left <= 3 else 4, tags=["lock"])
+            st["alerted"] = sorted(set(st.get("alerted", [])) | set(crossed))
+            state[dom] = st
+
+    save_state("ssl.json", state)
+    ok = sum(1 for e, _ in out.values() if e)
+    log(f"SSL: {ok}/{len(out)} sertifikata očitano (sada proveravano {len(todo)})")
     return out
 
 
@@ -678,12 +753,23 @@ def sync(dry=False):
         except Exception as e:
             log(f"[upozorenje] provera isteka domena nije uspela: {e}")
 
+    # 2b) SSL sertifikati (sync sam proverava, da bi alarmi išli na topic za istek)
+    ssl_check = env_bool("SSL_CHECK", "true")
+    ssl_info = {}
+    if ssl_check:
+        try:
+            ssl_info = check_ssl({d: f"{u} ({s})" for d, (s, u, _, _) in desired.items()})
+        except Exception as e:
+            log(f"[upozorenje] SSL provera nije uspela: {e}")
+
     on_removed = env("ON_REMOVED", "pause").lower()
     keyword = env("CONTENT_ERROR_KEYWORD", "Fatal error")
     site_base = {
         "interval": env_int("MONITOR_INTERVAL", 300),
         "retryInterval": env_int("RETRY_INTERVAL", 60),
         "maxretries": env_int("MONITOR_RETRIES", 3),
+        # Kumin SSL alarm ide na iste notifikacije kao padovi — kad sync proverava SSL, gasimo ga
+        "expiryNotification": not ssl_check,
     }
     if keyword:
         site_base.update(type=MonitorType.KEYWORD, keyword=keyword, invertKeyword=True)
@@ -742,10 +828,18 @@ def sync(dry=False):
             tag_value = f"{srv}/{user}"
             parent = groups.get(srv)
             want = dict(site_base)
+            now = datetime.now(timezone.utc)
+            parts = []
             exp = expiry.get(dom)
             if exp:
-                left = (exp - datetime.now(timezone.utc)).days
-                want["description"] = f"{EXPIRY_PREFIX} {exp:%d.%m.%Y} ({left} dana)"
+                parts.append(f"{EXPIRY_PREFIX} {exp:%d.%m.%Y} ({(exp - now).days} d)")
+            sexp, serr = ssl_info.get(dom, (None, None))
+            if sexp:
+                parts.append(f"SSL ističe: {sexp:%d.%m.%Y} ({(sexp - now).days} d)")
+            elif serr and ssl_check:
+                parts.append(f"SSL: {serr[:80]}")
+            if parts:
+                want["description"] = " · ".join(parts)
 
             if dom in unmanaged and dom not in managed:
                 continue  # već postoji ručni monitor, ne dupliramo
@@ -762,7 +856,6 @@ def sync(dry=False):
                     parent=parent,
                     maxredirects=10,
                     accepted_statuscodes=["200-299", "300-399"],
-                    expiryNotification=True,  # upozorenje kad SSL ističe
                     **want,
                 )
                 mid = res["monitorID"]
@@ -788,7 +881,7 @@ def sync(dry=False):
             if enforce:
                 # opis menjamo samo ako je prazan ili ga je pisao sync
                 if "description" in want and (m.get("description") or "").strip() and \
-                        not (m.get("description") or "").startswith(EXPIRY_PREFIX):
+                        not (m.get("description") or "").startswith(SYNC_DESC_PREFIXES):
                     want.pop("description")
                 ch = monitor_changes(m, want)
                 if ch:
@@ -898,7 +991,13 @@ def main():
     ap.add_argument("--loop", action="store_true", help="ponavljaj na SYNC_INTERVAL sekundi")
     ap.add_argument("--expiry", metavar="DOMEN", help="test: proveri kada ističe domen")
     ap.add_argument("--test-ntfy", action="store_true", help="test: probna poruka na telefon")
+    ap.add_argument("--ssl", metavar="DOMEN", help="test: kada ističe SSL sertifikat")
     args = ap.parse_args()
+
+    if args.ssl:
+        exp, err = get_cert(args.ssl.lower())
+        print(f"{args.ssl}: SSL ističe {exp:%d.%m.%Y}" if exp else f"{args.ssl}: {err}")
+        return
 
     if args.expiry:
         exp, src = lookup_expiry(args.expiry.lower())
@@ -906,7 +1005,7 @@ def main():
               else f"{args.expiry}: datum nije pronađen (izvor: {src})")
         return
     if args.test_ntfy:
-        for var in ("NTFY_TOPIC_SITES", "NTFY_TOPIC_INFRA"):
+        for var in ("NTFY_TOPIC_SITES", "NTFY_TOPIC_INFRA", "NTFY_TOPIC_EXPIRY"):
             ntfy_send(env(var, ""), "Uptime Kuma test", f"Probna poruka ({var})", 3, ["test_tube"])
             print(f"poslato na {var}={env(var, '') or '(prazno)'}")
         return

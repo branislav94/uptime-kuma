@@ -22,12 +22,13 @@ sajtove i infrastrukturu sa WHM/cPanel servera. Pokreće se kao Dockge stack
 - `Lokalna veza (Kuma)`: ping 1.1.1.1 / 8.8.8.8 — ako su dole, padovi su lažni
 
 **Notifikacije** — ntfy (aplikacija na telefonu)
-- `NTFY_TOPIC_SITES` (prioritet 3/4) i `NTFY_TOPIC_INFRA` (prioritet 5)
+- `NTFY_TOPIC_SITES` (prioritet 3/4), `NTFY_TOPIC_INFRA` (prioritet 5), `NTFY_TOPIC_EXPIRY`
 - poruka „kuma-sync ne radi" posle 3 neuspela sync-a
 
-**Istek domena**
-- RDAP gde postoji, WHOIS za `.rs` / `.io` i ostale bez RDAP-a
-- datum isteka u opisu monitora; alarm na 30/14/7/3/1 dan (stanje u `sync-state/`)
+**Istek domena i SSL-a** — poseban ntfy kanal `NTFY_TOPIC_EXPIRY`
+- domeni: RDAP gde postoji, WHOIS za `.rs` / `.io` i ostale bez RDAP-a; alarm na 30/14/7/3/1 dan
+- SSL: sertifikat koji sajt stvarno servira; alarm na 14/7/3/1 dan (= AutoSSL ne uspeva da obnovi)
+- oba datuma u opisu monitora; stanje alarma u `sync-state/` (ne ponavljaju se posle restarta)
 
 ## Postavljanje
 
@@ -52,6 +53,7 @@ docker compose logs -f kuma-sync                                  # log
 docker compose exec kuma-sync python kuma_sync.py --dry-run       # šta bi uradio
 docker compose exec kuma-sync python kuma_sync.py --test-ntfy     # probna poruka
 docker compose exec kuma-sync python kuma_sync.py --expiry x.rs   # istek domena
+docker compose exec kuma-sync python kuma_sync.py --ssl x.rs      # istek SSL-a
 docker compose up -d --build --force-recreate kuma-sync           # posle izmene skripte
 docker compose up -d --force-recreate kuma-sync                   # posle izmene .env
 ```
