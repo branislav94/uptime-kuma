@@ -15,6 +15,8 @@ sajtove i infrastrukturu sa WHM/cPanel servera. Pokreće se kao Dockge stack
   `addon` / `sub` / `parked`, `Cloudflare`
 - keyword provera: sajt je dole i kad vrati 200, ali stranica sadrži `Fatal error`
 - domen preseljen na drugi server → monitor se sam premesti; domen nestao → pauza
+  sa tagom `auto-pauza`; kad se domen vrati, sync ga ponovo pokreće
+- **ručno pauzirane monitore sync nikad ne pokreće** (samo one sa tagom `auto-pauza`)
 
 **Infrastruktura** (grupa `Infrastruktura`)
 - za svaki WHM server: ping, WHM, cPanel, Webmail, SMTP 465/587, IMAPS, FTP

@@ -54,6 +54,10 @@ TAG_NAME = "cpanel-sync"
 TAG_COLOR = "#2563EB"
 CF_TAG_NAME = "Cloudflare"
 CF_TAG_COLOR = "#F38020"
+# Monitore koje je SYNC pauzirao obeležava ovim tagom i samo njih ponovo pokreće.
+# Ručno pauzirane monitore (bez ovog taga) nikad ne pokreće.
+PAUSE_TAG_NAME = "auto-pauza"
+PAUSE_TAG_COLOR = "#6B7280"
 INFRA_TAG_NAME = "infra"
 INFRA_TAG_COLOR = "#DC2626"
 # Tagovi za tip domena (main se ne obeležava)
@@ -584,6 +588,34 @@ def managed_tag(monitor):
     return find_tag(monitor, TAG_NAME)
 
 
+def sync_pause(api, m, pause_tag_id, dry):
+    """Pauziraj monitor i obeleži da ga je pauzirao sync."""
+    if dry:
+        return
+    if not find_tag(m, PAUSE_TAG_NAME):
+        api.add_monitor_tag(tag_id=pause_tag_id, monitor_id=m["id"], value="")
+    api.pause_monitor(m["id"])
+
+
+def sync_resume(api, m, label, stats, dry):
+    """Nastavi praćenje SAMO ako je monitor pauzirao sync. Vraća True ako je nastavljen."""
+    t = find_tag(m, PAUSE_TAG_NAME)
+    if m.get("active", True):
+        # aktivan — ako ima zaostali auto-pauza tag (npr. ti si ga ručno pokrenuo), skloni tag
+        if t and not dry:
+            api.delete_monitor_tag(tag_id=t["tag_id"], monitor_id=m["id"], value=t.get("value", ""))
+        return False
+    if not t:
+        stats["ručno pauzirano"] += 1  # ti si ga pauzirao — ne diramo
+        return False
+    log(f"▶ {label}  ponovo za praćenje, nastavljam")
+    stats["nastavljeno"] += 1
+    if not dry:
+        api.resume_monitor(m["id"])
+        api.delete_monitor_tag(tag_id=t["tag_id"], monitor_id=m["id"], value=t.get("value", ""))
+    return True
+
+
 def ensure_group(api, group_name, monitors, dry):
     for m in monitors:
         if m["type"] == MonitorType.GROUP and m["name"] == group_name:
@@ -785,6 +817,7 @@ def sync(dry=False):
         tag_id = get_tag_id(api, dry)
         cf_tag_id = get_tag_id(api, dry, CF_TAG_NAME, CF_TAG_COLOR)
         infra_tag_id = get_tag_id(api, dry, INFRA_TAG_NAME, INFRA_TAG_COLOR)
+        pause_tag_id = get_tag_id(api, dry, PAUSE_TAG_NAME, PAUSE_TAG_COLOR)
         type_tag_ids = {t: get_tag_id(api, dry, t, c) for t, c in TYPE_TAGS.items()}
 
         extra = extra_notification_ids(api)
@@ -913,11 +946,7 @@ def sync(dry=False):
                     log(f"# {dom}  skidam tag {t}")
                     if not dry:
                         api.delete_monitor_tag(tag_id=tid, monitor_id=m["id"], value=has_t.get("value", ""))
-            if not m.get("active", True):
-                log(f"▶ {dom}  ponovo na serveru, nastavljam praćenje")
-                stats["nastavljeno"] += 1
-                if not dry:
-                    api.resume_monitor(m["id"])
+            sync_resume(api, m, dom, stats, dry)
 
         # 4) sajtovi kojih više nema
         for dom, m in managed.items():
@@ -938,7 +967,7 @@ def sync(dry=False):
             if on_removed == "delete":
                 api.delete_monitor(m["id"])
             else:
-                api.pause_monitor(m["id"])
+                sync_pause(api, m, pause_tag_id, dry)
 
         # 5) infrastruktura
         infra = build_infra(servers)
@@ -970,16 +999,12 @@ def sync(dry=False):
                 stats["infra~"] += 1
                 if not dry:
                     api.edit_monitor(m["id"], **ch)
-            if not m.get("active", True):
-                log(f"▶ infra  {key}")
-                if not dry:
-                    api.resume_monitor(m["id"])
+            sync_resume(api, m, "infra  " + key, stats, dry)
         for key, m in infra_managed.items():
             if key not in infra_keys and m.get("active", True):
                 log(f"⏸ infra  {key}  (nije više u konfiguraciji)")
                 stats["infra-"] += 1
-                if not dry:
-                    api.pause_monitor(m["id"])
+                sync_pause(api, m, pause_tag_id, dry)
 
     summary = ", ".join(f"{k}={v}" for k, v in sorted(stats.items())) or "bez promena"
     log(f"gotovo{' (DRY RUN)' if dry else ''}: {summary}")
