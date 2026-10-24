@@ -1,8 +1,8 @@
-# Dockge stack: ceo folder ide u /opt/stacks/uptime-kuma/
-#   /opt/stacks/uptime-kuma/compose.yaml
-#   /opt/stacks/uptime-kuma/.env
-#   /opt/stacks/uptime-kuma/sync/Dockerfile
-#   /opt/stacks/uptime-kuma/sync/kuma_sync.py
+# Dockge stack: the whole folder goes into the stacks directory, e.g. /opt/stacks/uptime-kuma/
+#   compose.yaml
+#   .env                 (copy of .env.example, filled in — never committed)
+#   sync/Dockerfile
+#   sync/kuma_sync.py
 
 services:
   uptime-kuma:
@@ -35,5 +35,5 @@ services:
       - TZ=Europe/Belgrade
       - STATE_DIR=/app/state
     volumes:
-      # pamti datume isteka domena i poslate alarme (da ne šalje iste poruke posle restarta)
+      # remembers domain/SSL expiry dates and sent alerts (no repeated messages after a restart)
       - ./sync-state:/app/state

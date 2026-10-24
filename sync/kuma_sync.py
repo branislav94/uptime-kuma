@@ -1,33 +1,33 @@
 #!/usr/bin/env python3
 """
-kuma_sync.py — sinhronizuje WHM/cPanel servere u Uptime Kuma.
+kuma_sync.py — syncs WHM/cPanel servers into Uptime Kuma.
 
-Sajtovi
-- Povlači domene preko WHM API-ja (get_domain_info + listaccts) sa jednog ili više servera
-- Za svaki server grupa "cPanel · cp1"; monitori proveravaju status I sadržaj (keyword)
-- Tagovi: cpanel-sync (server/user), addon/sub/parked, Cloudflare
-- Prati samo domene koji DNS-om stvarno pokazuju na naš server (ili Cloudflare)
-- Domen preseljen sa cp2 na cp1 -> monitor se premesti; domen nestao -> pauza
+Sites
+- Pulls domains via the WHM API (get_domain_info + listaccts) from one or more servers
+- One group per server ("cPanel · cp1"); monitors check status AND content (keyword)
+- Tags: cpanel-sync (server/user), addon/sub/parked, Cloudflare
+- Only monitors domains whose DNS actually points to our server (or Cloudflare)
+- Domain moved from cp2 to cp1 -> monitor is moved; domain gone -> paused
 
-Infrastruktura
-- Za svaki WHM server automatski: WHM, cPanel, Webmail, mail/FTP portovi, ping
-- Nameserveri (DNS monitor), dodatni monitori iz INFRA_EXTRA, provera sopstvene linije
+Infrastructure
+- Automatically for every WHM server: WHM, cPanel, Webmail, mail/FTP ports, ping
+- Nameservers (DNS monitor), extra monitors from INFRA_EXTRA, own uplink check
 
-Notifikacije
-- ntfy (aplikacija na telefonu): poseban topic za sajtove i za infrastrukturu
+Notifications
+- ntfy (phone app): separate topics for sites and for infrastructure
 
-Istek domena i SSL-a (poseban ntfy topic NTFY_TOPIC_EXPIRY)
-- RDAP gde postoji, WHOIS za .rs/.io i ostale bez RDAP-a; alarm na 30/14/7/3/1 dan
-- SSL sertifikat koji sajt stvarno servira; alarm na 14/7/3/1 dan (= AutoSSL ne obnavlja)
-- Datume upisuje u opis monitora
+Domain and SSL expiry (separate ntfy topic NTFY_TOPIC_EXPIRY)
+- RDAP where available, WHOIS for .rs/.io and other TLDs without RDAP; alerts at 30/14/7/3/1 days
+- SSL certificate actually served by the site; alerts at 14/7/3/1 days (= AutoSSL is not renewing)
+- Dates are written into the monitor description
 
-Pokretanje:
-  python kuma_sync.py                  # jedan prolaz
-  python kuma_sync.py --dry-run        # samo prikaže šta bi uradio
-  python kuma_sync.py --loop           # radi na svakih SYNC_INTERVAL sekundi
-  python kuma_sync.py --expiry DOMEN   # test: kada ističe domen
-  python kuma_sync.py --test-ntfy      # test: pošalji probnu poruku na telefon
-  python kuma_sync.py --ssl DOMEN      # test: kada ističe SSL sertifikat
+Usage:
+  python kuma_sync.py                  # single run
+  python kuma_sync.py --dry-run        # only show what would change
+  python kuma_sync.py --loop           # run every SYNC_INTERVAL seconds
+  python kuma_sync.py --expiry DOMAIN  # test: when does a domain expire
+  python kuma_sync.py --ssl DOMAIN     # test: when does an SSL certificate expire
+  python kuma_sync.py --test-ntfy      # test: send a test message to the phone
 """
 import argparse
 import fnmatch
@@ -37,12 +37,12 @@ import os
 import re
 import socket
 import ssl
-from concurrent.futures import ThreadPoolExecutor
 import sys
 import threading
 import time
 import traceback
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from urllib.parse import urlparse
 
@@ -54,27 +54,38 @@ TAG_NAME = "cpanel-sync"
 TAG_COLOR = "#2563EB"
 CF_TAG_NAME = "Cloudflare"
 CF_TAG_COLOR = "#F38020"
-# Monitore koje je SYNC pauzirao obeležava ovim tagom i samo njih ponovo pokreće.
-# Ručno pauzirane monitore (bez ovog taga) nikad ne pokreće.
-PAUSE_TAG_NAME = "auto-pauza"
+# Monitors paused BY THE SYNC get this tag, and only those are resumed by it.
+# Monitors you pause by hand (no tag) are never resumed.
+PAUSE_TAG_NAME = "auto-paused"
 PAUSE_TAG_COLOR = "#6B7280"
 INFRA_TAG_NAME = "infra"
 INFRA_TAG_COLOR = "#DC2626"
-# Tagovi za tip domena (main se ne obeležava)
+# Domain type tags (main domains are not tagged)
 TYPE_TAGS = {
     "addon": "#7C3AED",
     "sub": "#0D9488",
     "parked": "#CA8A04",
 }
 GROUP_PREFIX = "cPanel · "
-INFRA_GROUP = "Infrastruktura"
-LOCAL_GROUP = "Lokalna veza (Kuma)"
-NTFY_SITES_NAME = "ntfy · sajtovi"
-NTFY_INFRA_NAME = "ntfy · infrastruktura"
-EXPIRY_PREFIX = "Domen ističe:"
-SSL_PREFIX = "SSL"
-# opis monitora koji počinje ovim je pisao sync (sme da ga menja)
-SYNC_DESC_PREFIXES = (EXPIRY_PREFIX, "SSL ističe:", "SSL:")
+INFRA_GROUP = "Infrastructure"
+LOCAL_GROUP = "Local uplink (Kuma)"
+NTFY_SITES_NAME = "ntfy · sites"
+NTFY_INFRA_NAME = "ntfy · infrastructure"
+EXPIRY_PREFIX = "Domain expires:"
+SSL_EXPIRY_PREFIX = "SSL expires:"
+DATE_FMT = "%Y-%m-%d"
+
+# Names used by earlier (Serbian) versions — existing objects are renamed, not duplicated
+LEGACY_NAMES = {
+    INFRA_GROUP: ["Infrastruktura"],
+    LOCAL_GROUP: ["Lokalna veza (Kuma)"],
+    NTFY_SITES_NAME: ["ntfy · sajtovi"],
+    NTFY_INFRA_NAME: ["ntfy · infrastruktura"],
+    PAUSE_TAG_NAME: ["auto-pauza"],
+}
+# A description starting with one of these was written by the sync (safe to overwrite)
+SYNC_DESC_PREFIXES = (EXPIRY_PREFIX, SSL_EXPIRY_PREFIX, "SSL:",
+                      "Domen ističe:", "SSL ističe:")
 
 STATE_DIR = os.environ.get("STATE_DIR", "/app/state")
 
@@ -84,7 +95,7 @@ STATE_DIR = os.environ.get("STATE_DIR", "/app/state")
 def env(name, default=None, required=False):
     val = os.environ.get(name, default)
     if required and not val:
-        sys.exit(f"[greška] nedostaje env promenljiva {name}")
+        sys.exit(f"[error] missing environment variable {name}")
     return val
 
 
@@ -120,7 +131,7 @@ def save_state(name, data):
             json.dump(data, f, indent=1, sort_keys=True)
         os.replace(tmp, os.path.join(STATE_DIR, name))
     except Exception as e:
-        log(f"[upozorenje] ne mogu da sačuvam {name}: {e}")
+        log(f"[warning] cannot save {name}: {e}")
 
 
 # ---------------------------------------------------------------- ntfy ---
@@ -130,12 +141,12 @@ def ntfy_server():
 
 
 def expiry_topic():
-    """Istek domena i SSL-a: poseban topic, ili topic sajtova ako nije podešen."""
+    """Domain/SSL expiry: its own topic, or the sites topic if not set."""
     return env("NTFY_TOPIC_EXPIRY", "") or env("NTFY_TOPIC_SITES", "")
 
 
 def ntfy_send(topic, title, message, priority=3, tags=None):
-    """Direktna poruka na telefon (za istek domena i greške samog sync-a)."""
+    """Direct phone message (expiry alerts and errors of the sync itself)."""
     if not topic:
         return
     headers = {}
@@ -147,7 +158,7 @@ def ntfy_send(topic, title, message, priority=3, tags=None):
             "priority": priority, "tags": tags or [],
         }, headers=headers, timeout=15).raise_for_status()
     except Exception as e:
-        log(f"[upozorenje] ntfy slanje nije uspelo: {e}")
+        log(f"[warning] ntfy send failed: {e}")
 
 
 # ---------------------------------------------------------------- WHM ---
@@ -157,12 +168,12 @@ def parse_servers():
     for item in env_list("WHM_SERVERS"):
         parts = item.split("|")
         if len(parts) != 3:
-            sys.exit(f"[greška] WHM_SERVERS stavka mora biti ime|url|token: {item!r}")
+            sys.exit(f"[error] WHM_SERVERS entry must be name|url|token: {item!r}")
         name, url, token = (p.strip() for p in parts)
         servers.append({"name": name, "url": url.rstrip("/"), "token": token,
                         "host": urlparse(url).hostname})
     if not servers:
-        sys.exit("[greška] WHM_SERVERS je prazan")
+        sys.exit("[error] WHM_SERVERS is empty")
     return servers
 
 
@@ -183,8 +194,8 @@ def whm_call(server, func, **params):
     return data.get("data", {})
 
 
-# Cloudflare IPv4 opsezi (https://www.cloudflare.com/ips-v4) — domen iza CF proxy-ja
-# ne pokazuje na naš IP, ali je i dalje hostovan kod nas.
+# Cloudflare IPv4 ranges (https://www.cloudflare.com/ips-v4) — a domain behind the CF proxy
+# doesn't point to our IP, but is still hosted by us.
 CLOUDFLARE_NETS = [ipaddress.ip_network(n) for n in (
     "173.245.48.0/20", "103.21.244.0/22", "103.22.200.0/22", "103.31.4.0/22",
     "141.101.64.0/18", "108.162.192.0/18", "190.93.240.0/20", "188.114.96.0/20",
@@ -208,7 +219,7 @@ def is_cloudflare(ip):
 
 
 def dns_verdict(domain, server_ips):
-    """Vraća (verdict, na_cloudflare). verdict: 'ok' | 'nxdomain' | 'elsewhere:<ip>'"""
+    """Returns (verdict, on_cloudflare). verdict: 'ok' | 'nxdomain' | 'elsewhere:<ip>'"""
     mode = env("DNS_CHECK", "ours").lower()
     ips = resolve_a(domain)
     on_cf = bool(ips) and all(is_cloudflare(ip) for ip in ips)
@@ -226,7 +237,7 @@ def dns_verdict(domain, server_ips):
 
 
 def fetch_domains(server):
-    """Vraća {domen: (cpanel_user, na_cloudflare, tip)} za jedan WHM server, posle filtera."""
+    """Returns {domain: (cpanel_user, on_cloudflare, type)} for one WHM server, after filters."""
     types = set(env_list("DOMAIN_TYPES", "main,addon,parked,sub"))
     excludes = env_list("EXCLUDE", "")
     skip_suspended = env_bool("SKIP_SUSPENDED")
@@ -236,7 +247,7 @@ def fetch_domains(server):
 
     domains = whm_call(server, "get_domain_info").get("domains", [])
 
-    # IP adrese servera: sve IP iz naloga + ipv4 iz domain_info + SERVER_IPS iz .env
+    # Server IPs: all account IPs + ipv4 from domain_info + SERVER_IPS from .env
     server_ips = set(env_list("SERVER_IPS", ""))
     server_ips |= {a.get("ip") for a in accts if a.get("ip")}
     for d in domains:
@@ -244,19 +255,19 @@ def fetch_domains(server):
             if d.get(key):
                 server_ips.add(d[key])
 
-    # dijagnostika: šta WHM uopšte vraća
+    # diagnostics: what WHM actually returns
     users_with_domains = {d.get("user") for d in domains}
     by_type = Counter(d.get("domain_type") for d in domains)
-    log(f"{server['name']}: WHM vraća {len(domains)} domena "
+    log(f"{server['name']}: WHM returned {len(domains)} domains "
         f"({', '.join(f'{k}={v}' for k, v in sorted(by_type.items()))}) "
-        f"za {len(users_with_domains)}/{len(accts)} naloga")
+        f"for {len(users_with_domains)}/{len(accts)} accounts")
     missing_users = {a["user"] for a in accts} - users_with_domains
     if missing_users:
-        log(f"{server['name']}: [upozorenje] get_domain_info ne vraća domene za naloge: "
+        log(f"{server['name']}: [warning] get_domain_info returned no domains for accounts: "
             f"{', '.join(sorted(missing_users))}")
 
-    # Pomoćni subdomeni koje cPanel sam pravi uz svaki addon domen
-    # (npr. triaris.rs.lartgroupe.com) — isti docroot kao addon, nisu pravi sajt.
+    # Helper subdomains cPanel creates for every addon domain
+    # (e.g. triaris.rs.lartgroupe.com) — same docroot as the addon, not a real site.
     addon_docroots = {(d.get("user"), d.get("docroot")) for d in domains
                       if d.get("domain_type") == "addon" and d.get("docroot")}
     addon_names = {}
@@ -269,7 +280,7 @@ def fetch_domains(server):
             return False
         name = d.get("domain", "").lower()
         if d.get("docroot") and addon_docroots:
-            # WHM vraća docroot -> to je pouzdan kriterijum, ne nagađamo po imenu
+            # WHM returns docroot -> reliable, no guessing by name
             return (d.get("user"), d.get("docroot")) in addon_docroots
         for a in addon_names.get(d.get("user"), []):
             if name.startswith(a + ".") or name.split(".")[0] == a.split(".")[0]:
@@ -281,31 +292,31 @@ def fetch_domains(server):
         domain = d.get("domain", "").lower().strip(".")
         user = d.get("user", "")
         if not domain or d.get("domain_type") not in types:
-            skipped["tip"] += 1
+            skipped["type"] += 1
             continue
         if user in suspended:
-            skipped["suspendovan"] += 1
+            skipped["suspended"] += 1
             continue
         if is_addon_helper(d):
-            skipped["addon-pomoćni-sub"] += 1
+            skipped["addon-helper-sub"] += 1
             continue
         if any(fnmatch.fnmatch(domain, pat) for pat in excludes):
-            skipped["exclude"] += 1
+            skipped["excluded"] += 1
             continue
         verdict, on_cf = dns_verdict(domain, server_ips)
         if verdict != "ok":
             skipped["dns"] += 1
-            log(f"  preskačem {domain} ({user}): DNS {verdict}")
+            log(f"  skipping {domain} ({user}): DNS {verdict}")
             continue
         result[domain] = (user, on_cf, d.get("domain_type"))
     if skipped:
-        log(f"{server['name']}: preskočeno " + ", ".join(f"{k}={v}" for k, v in skipped.items()))
+        log(f"{server['name']}: skipped " + ", ".join(f"{k}={v}" for k, v in skipped.items()))
     return result
 
 
-# --------------------------------------------------------- istek domena ---
+# ------------------------------------------------------- domain expiry ---
 
-_tld = tldextract.TLDExtract(suffix_list_urls=(), cache_dir=None)  # radi offline
+_tld = tldextract.TLDExtract(suffix_list_urls=(), cache_dir=None)  # works offline
 
 
 def registrable(domain):
@@ -328,7 +339,7 @@ def rdap_base(tld):
                 for t in tlds:
                     _rdap_map[t.lower()] = urls[0].rstrip("/") + "/"
         except Exception as e:
-            log(f"[upozorenje] IANA RDAP lista nedostupna ({e}), koristim samo WHOIS")
+            log(f"[warning] IANA RDAP list unavailable ({e}), using WHOIS only")
     return _rdap_map.get(tld.lower())
 
 
@@ -351,7 +362,7 @@ def whois_server_for(tld):
             m = re.search(r"(?im)^whois:\s*(\S+)", whois_query("whois.iana.org", tld))
             srv = m.group(1) if m else None
         except Exception as e:
-            log(f"[upozorenje] whois.iana.org za .{tld}: {e}")
+            log(f"[warning] whois.iana.org for .{tld}: {e}")
         _whois_servers[tld] = srv
     return _whois_servers[tld]
 
@@ -364,8 +375,8 @@ _DATE_FORMATS = (
 
 def parse_date(text):
     text = text.strip()
-    text = re.sub(r"\.\d+(?=Z|$|[+-])", "", text)          # 2027-01-01T00:00:00.000Z
-    text = re.sub(r"(?<=\d\d:\d\d:\d\d)[+-]\d\d:?\d\d$", "", text).strip()  # ...T10:00:00+02:00
+    text = re.sub(r"\.\d+(?=Z|$|[+-])", "", text)                            # ...00.000Z
+    text = re.sub(r"(?<=\d\d:\d\d:\d\d)[+-]\d\d:?\d\d$", "", text).strip()   # ...T10:00:00+02:00
     text = re.sub(r"\s+(UTC|GMT|CET|CEST)$", "", text)
     for fmt in _DATE_FORMATS:
         try:
@@ -396,7 +407,7 @@ def parse_whois_expiry(text):
 
 
 def lookup_expiry(domain):
-    """Vraća (datetime | None, izvor)."""
+    """Returns (datetime | None, source)."""
     tld = domain.rsplit(".", 1)[-1]
     base = rdap_base(tld)
     if base:
@@ -417,12 +428,12 @@ def lookup_expiry(domain):
             return parse_whois_expiry(whois_query(srv, domain)), "whois:" + srv
         except Exception as e:
             log(f"  WHOIS {domain} ({srv}): {e}")
-    return None, "nema"
+    return None, "none"
 
 
 def check_expiry(reg_domains):
-    """reg_domains: {registrable: [opis klijenta, ...]}. Vraća {registrable: datetime|None}.
-    Proverava svaki domen najviše jednom u EXPIRY_CHECK_HOURS, šalje ntfy alarme."""
+    """reg_domains: {registrable: [client label, ...]}. Returns {registrable: datetime|None}.
+    Checks each domain at most once per EXPIRY_CHECK_HOURS and sends ntfy alerts."""
     state = load_state("expiry.json")
     every = env_int("EXPIRY_CHECK_HOURS", 24) * 3600
     days_list = sorted({int(x) for x in env_list("DOMAIN_EXPIRY_DAYS", "30,14,7,3,1")}, reverse=True)
@@ -436,14 +447,14 @@ def check_expiry(reg_domains):
         if time.time() - st.get("checked", 0) > every:
             exp, src = lookup_expiry(dom)
             checked += 1
-            time.sleep(1)  # pristojno prema WHOIS serverima
+            time.sleep(1)  # be polite to WHOIS servers
             new_exp = exp.isoformat() if exp else None
             if new_exp != st.get("expires"):
-                st["alerted"] = []  # obnovljen ili prvi put viđen
+                st["alerted"] = []  # renewed or seen for the first time
             st.update({"expires": new_exp, "source": src, "checked": time.time()})
             state[dom] = st
             if not exp:
-                log(f"  istek {dom}: nepoznat ({src})")
+                log(f"  expiry {dom}: unknown ({src})")
         exp = datetime.fromisoformat(st["expires"]) if st.get("expires") else None
         out[dom] = exp
         if not exp:
@@ -452,24 +463,24 @@ def check_expiry(reg_domains):
         crossed = [d for d in days_list if left <= d and d not in st.get("alerted", [])]
         if crossed:
             who = ", ".join(reg_domains[dom])
-            title = (f"Domen {dom} je ISTEKAO" if left < 0
-                     else f"Domen {dom} ističe za {left} dana")
-            log(f"⚠ {title} ({exp:%d.%m.%Y}) — {who}")
-            ntfy_send(topic, title, f"Datum isteka: {exp:%d.%m.%Y}\nKlijent: {who}",
+            title = (f"Domain {dom} has EXPIRED" if left < 0
+                     else f"Domain {dom} expires in {left} days")
+            log(f"⚠ {title} ({exp:{DATE_FMT}}) — {who}")
+            ntfy_send(topic, title, f"Expiry date: {exp:{DATE_FMT}}\nClient: {who}",
                       priority=5 if left <= 7 else 4, tags=["hourglass"])
             st["alerted"] = sorted(set(st.get("alerted", [])) | set(crossed))
             state[dom] = st
 
     save_state("expiry.json", state)
     known = sum(1 for v in out.values() if v)
-    log(f"istek domena: {known}/{len(out)} poznato (sada proveravano {checked})")
+    log(f"domain expiry: {known}/{len(out)} known (checked now: {checked})")
     return out
 
 
 # ------------------------------------------------------------ SSL ---
 
 def get_cert(domain, port=443):
-    """Vraća (notAfter datetime | None, greška | None) za sertifikat koji sajt stvarno servira."""
+    """Returns (notAfter datetime | None, error | None) for the certificate the site actually serves."""
     ctx = ssl.create_default_context()
     try:
         with socket.create_connection((domain, port), timeout=10) as sock:
@@ -478,14 +489,14 @@ def get_cert(domain, port=443):
         exp = datetime.fromtimestamp(ssl.cert_time_to_seconds(cert["notAfter"]), timezone.utc)
         return exp, None
     except ssl.SSLCertVerificationError as e:
-        return None, f"nevažeći sertifikat: {e.verify_message}"
+        return None, f"invalid certificate: {e.verify_message}"
     except Exception as e:
         return None, f"{type(e).__name__}: {e}"
 
 
 def check_ssl(domains):
-    """domains: {domen: opis klijenta}. Vraća {domen: (datetime|None, greška|None)}.
-    Alarm kad ostane SSL_EXPIRY_DAYS dana — kod cPanel-a to znači da AutoSSL ne uspeva da obnovi."""
+    """domains: {domain: client label}. Returns {domain: (datetime|None, error|None)}.
+    Alerts at SSL_EXPIRY_DAYS days left — with cPanel that means AutoSSL is failing to renew."""
     state = load_state("ssl.json")
     every = env_int("EXPIRY_CHECK_HOURS", 24) * 3600
     days_list = sorted({int(x) for x in env_list("SSL_EXPIRY_DAYS", "14,7,3,1")}, reverse=True)
@@ -497,7 +508,7 @@ def check_ssl(domains):
             st = state.get(dom, {})
             new_exp = exp.isoformat() if exp else None
             if new_exp != st.get("expires"):
-                st["alerted"] = []  # obnovljen
+                st["alerted"] = []  # renewed
             st.update({"expires": new_exp, "error": err, "checked": time.time()})
             state[dom] = st
             if err:
@@ -513,19 +524,19 @@ def check_ssl(domains):
         left = (exp - now).days
         crossed = [d for d in days_list if left <= d and d not in st.get("alerted", [])]
         if crossed:
-            title = (f"SSL za {dom} je ISTEKAO" if left < 0
-                     else f"SSL za {dom} ističe za {left} dana")
-            log(f"⚠ {title} ({exp:%d.%m.%Y}) — {who}")
+            title = (f"SSL for {dom} has EXPIRED" if left < 0
+                     else f"SSL for {dom} expires in {left} days")
+            log(f"⚠ {title} ({exp:{DATE_FMT}}) — {who}")
             ntfy_send(expiry_topic(), title,
-                      f"Datum isteka: {exp:%d.%m.%Y}\nKlijent: {who}\n"
-                      f"AutoSSL verovatno ne uspeva da obnovi — WHM > Manage AutoSSL > Logs",
+                      f"Expiry date: {exp:{DATE_FMT}}\nClient: {who}\n"
+                      f"AutoSSL is probably failing to renew — WHM > Manage AutoSSL > Logs",
                       priority=5 if left <= 3 else 4, tags=["lock"])
             st["alerted"] = sorted(set(st.get("alerted", [])) | set(crossed))
             state[dom] = st
 
     save_state("ssl.json", state)
     ok = sum(1 for e, _ in out.values() if e)
-    log(f"SSL: {ok}/{len(out)} sertifikata očitano (sada proveravano {len(todo)})")
+    log(f"SSL: {ok}/{len(out)} certificates read (checked now: {len(todo)})")
     return out
 
 
@@ -539,17 +550,17 @@ def host_of(url):
 
 
 class ReadyKumaApi(UptimeKumaApi):
-    """UptimeKumaApi koji čeka da Kuma bude spremna za login.
+    """UptimeKumaApi that waits until Kuma is ready to accept a login.
 
-    Kuma 2.x registruje "login" handler tek na kraju obrade nove konekcije
-    (posle toga šalje "loginRequired"). Ako login stigne ranije, Kuma ga tiho
-    ignoriše i klijent visi do timeout-a. Zato čekamo "loginRequired"/"autoLogin".
+    Kuma 2.x registers its "login" handler only at the end of processing a new
+    connection (then it emits "loginRequired"). A login sent earlier is silently
+    ignored and the client hangs until timeout. So we wait for "loginRequired"/"autoLogin".
     """
 
     def connect(self):
         self._kuma_ready = threading.Event()
         self.sio.on("loginRequired", lambda *a: self._kuma_ready.set())
-        # autoLogin = auth isključen u Kumi; i dalje znači "spremno"
+        # autoLogin = auth disabled in Kuma; still means "ready"
         self.sio.on("autoLogin", lambda *a: (self._kuma_ready.set(), self._event_auto_login()))
         super().connect()
 
@@ -562,15 +573,22 @@ def connect_kuma():
         api = ReadyKumaApi(url, timeout=timeout)
         if api._kuma_ready.wait(ready_wait):
             return api
-        log(f"Kuma: konekcija nije spremna posle {ready_wait}s (pokušaj {attempt}/5), ponovo...")
+        log(f"Kuma: connection not ready after {ready_wait}s (attempt {attempt}/5), retrying...")
         api.disconnect()
         time.sleep(3)
-    raise RuntimeError("Kuma ne šalje loginRequired — proveri uptime-kuma log")
+    raise RuntimeError("Kuma never sent loginRequired — check the uptime-kuma log")
 
 
 def get_tag_id(api, dry, name=TAG_NAME, color=TAG_COLOR):
-    for t in api.get_tags():
+    tags = api.get_tags()
+    for t in tags:
         if t["name"] == name:
+            return t["id"]
+    for t in tags:  # rename a tag left over from an older version
+        if t["name"] in LEGACY_NAMES.get(name, []):
+            log(f"~ tag {t['name']} -> {name}")
+            if not dry:
+                api.edit_tag(t["id"], name=name)
             return t["id"]
     if dry:
         return None
@@ -578,8 +596,9 @@ def get_tag_id(api, dry, name=TAG_NAME, color=TAG_COLOR):
 
 
 def find_tag(monitor, name):
+    names = {name, *LEGACY_NAMES.get(name, [])}
     for t in monitor.get("tags") or []:
-        if t.get("name") == name:
+        if t.get("name") in names:
             return t
     return None
 
@@ -589,7 +608,7 @@ def managed_tag(monitor):
 
 
 def sync_pause(api, m, pause_tag_id, dry):
-    """Pauziraj monitor i obeleži da ga je pauzirao sync."""
+    """Pause a monitor and mark that the sync paused it."""
     if dry:
         return
     if not find_tag(m, PAUSE_TAG_NAME):
@@ -598,18 +617,18 @@ def sync_pause(api, m, pause_tag_id, dry):
 
 
 def sync_resume(api, m, label, stats, dry):
-    """Nastavi praćenje SAMO ako je monitor pauzirao sync. Vraća True ako je nastavljen."""
+    """Resume ONLY if the sync paused the monitor. Returns True if resumed."""
     t = find_tag(m, PAUSE_TAG_NAME)
     if m.get("active", True):
-        # aktivan — ako ima zaostali auto-pauza tag (npr. ti si ga ručno pokrenuo), skloni tag
+        # active — if a leftover auto-paused tag exists (e.g. you resumed it by hand), drop it
         if t and not dry:
             api.delete_monitor_tag(tag_id=t["tag_id"], monitor_id=m["id"], value=t.get("value", ""))
         return False
     if not t:
-        stats["ručno pauzirano"] += 1  # ti si ga pauzirao — ne diramo
+        stats["paused by hand"] += 1  # you paused it — leave it alone
         return False
-    log(f"▶ {label}  ponovo za praćenje, nastavljam")
-    stats["nastavljeno"] += 1
+    log(f"▶ {label}  back in scope, resuming")
+    stats["resumed"] += 1
     if not dry:
         api.resume_monitor(m["id"])
         api.delete_monitor_tag(tag_id=t["tag_id"], monitor_id=m["id"], value=t.get("value", ""))
@@ -620,7 +639,14 @@ def ensure_group(api, group_name, monitors, dry):
     for m in monitors:
         if m["type"] == MonitorType.GROUP and m["name"] == group_name:
             return m["id"]
-    log(f"+ grupa  {group_name}")
+    for m in monitors:  # rename a group left over from an older version
+        if m["type"] == MonitorType.GROUP and m["name"] in LEGACY_NAMES.get(group_name, []):
+            log(f"~ group {m['name']} -> {group_name}")
+            if not dry:
+                api.edit_monitor(m["id"], name=group_name)
+            m["name"] = group_name
+            return m["id"]
+    log(f"+ group  {group_name}")
     if dry:
         return None
     gid = api.add_monitor(type=MonitorType.GROUP, name=group_name)["monitorID"]
@@ -629,7 +655,7 @@ def ensure_group(api, group_name, monitors, dry):
 
 
 def ensure_ntfy(api, name, topic, priority, dry):
-    """Napravi/ažuriraj ntfy notifikaciju u Kumi. Vraća id ili None."""
+    """Create/update an ntfy notification in Kuma. Returns its id or None."""
     if not topic:
         return None
     want = {
@@ -641,14 +667,15 @@ def ensure_ntfy(api, name, topic, priority, dry):
     }
     if env("NTFY_TOKEN", ""):
         want["ntfyaccesstoken"] = env("NTFY_TOKEN")
+    names = [name, *LEGACY_NAMES.get(name, [])]
     for n in api.get_notifications():
-        if n.get("name") == name:
-            if any(n.get(k) != v for k, v in want.items()):
-                log(f"~ notifikacija {name}")
+        if n.get("name") in names:
+            if n.get("name") != name or any(n.get(k) != v for k, v in want.items()):
+                log(f"~ notification {n.get('name')} -> {name}")
                 if not dry:
                     api.edit_notification(n["id"], name=name, isDefault=False, **want)
             return n["id"]
-    log(f"+ notifikacija {name} (topic {topic})")
+    log(f"+ notification {name} (topic {topic})")
     if dry:
         return None
     return api.add_notification(name=name, isDefault=False, applyExisting=False, **want)["id"]
@@ -658,8 +685,10 @@ def extra_notification_ids(api):
     ids = [int(x) for x in env_list("NOTIFICATION_IDS", "")]
     if ids:
         return ids
+    ours = {NTFY_SITES_NAME, NTFY_INFRA_NAME,
+            *LEGACY_NAMES[NTFY_SITES_NAME], *LEGACY_NAMES[NTFY_INFRA_NAME]}
     return [n["id"] for n in api.get_notifications()
-            if n.get("isDefault") and n.get("name") not in (NTFY_SITES_NAME, NTFY_INFRA_NAME)]
+            if n.get("isDefault") and n.get("name") not in ours]
 
 
 def notif_set(m):
@@ -670,7 +699,7 @@ def notif_set(m):
 
 
 def monitor_changes(m, want):
-    """Razlike između postojećeg monitora i željenih podešavanja."""
+    """Differences between an existing monitor and the desired settings."""
     changes = {}
     for k, v in want.items():
         cur = m.get(k)
@@ -685,10 +714,10 @@ def monitor_changes(m, want):
     return changes
 
 
-# --------------------------------------------------------- infra lista ---
+# ----------------------------------------------------- infrastructure ---
 
 def build_infra(servers):
-    """Lista infrastrukturnih monitora: {key, group, type, ...kuma polja}."""
+    """List of infrastructure monitors: {key, group, type, ...kuma fields}."""
     items = []
     interval = env_int("INFRA_INTERVAL", 60)
 
@@ -714,17 +743,17 @@ def build_infra(servers):
     for ns in env_list("NAMESERVERS", ""):
         ips = sorted(resolve_a(ns))
         if not ips or not test_domain:
-            log(f"[upozorenje] nameserver {ns}: nema IP ili DNS_TEST_DOMAIN nije podešen")
+            log(f"[warning] nameserver {ns}: no IP or DNS_TEST_DOMAIN not set")
             continue
         add(f"DNS · {ns}", INFRA_GROUP, type=MonitorType.DNS, hostname=test_domain,
             dns_resolve_server=ips[0], port=53, dns_resolve_type="A")
 
-    # INFRA_EXTRA="ime|tip|cilj;ime|tip|cilj"
-    #   tip: http | http-insecure | port (host:port) | ping | dns (domen@resolver-ip)
+    # INFRA_EXTRA="name|type|target;name|type|target"
+    #   type: http | http-insecure | port (host:port) | ping | dns (domain@resolver-ip)
     for item in env_list("INFRA_EXTRA", "", sep=";"):
         parts = [p.strip() for p in item.split("|")]
         if len(parts) != 3:
-            log(f"[upozorenje] INFRA_EXTRA stavka mora biti ime|tip|cilj: {item!r}")
+            log(f"[warning] INFRA_EXTRA entry must be name|type|target: {item!r}")
             continue
         name, typ, target = parts
         typ = typ.lower()
@@ -741,9 +770,9 @@ def build_infra(servers):
             add(name, INFRA_GROUP, type=MonitorType.DNS, hostname=d,
                 dns_resolve_server=resolver or "1.1.1.1", port=53, dns_resolve_type="A")
         else:
-            log(f"[upozorenje] INFRA_EXTRA nepoznat tip {typ!r} za {name}")
+            log(f"[warning] INFRA_EXTRA unknown type {typ!r} for {name}")
 
-    # sopstvena linija: ako su ovi dole, padovi sajtova su verovatno lažni
+    # own uplink: if these are down, site outages are probably false alarms
     for ip in env_list("INTERNET_CHECK", "1.1.1.1,8.8.8.8"):
         add(f"Internet · {ip}", LOCAL_GROUP, type=MonitorType.PING, hostname=ip)
     return items
@@ -754,25 +783,25 @@ def build_infra(servers):
 def sync(dry=False):
     servers = parse_servers()
 
-    # 1) domeni sa svih servera
-    desired = {}  # domen -> (server, user, na_cloudflare, tip)
+    # 1) domains from all servers
+    desired = {}  # domain -> (server, user, on_cloudflare, type)
     for s in servers:
         try:
             doms = fetch_domains(s)
         except Exception as e:
-            # Ako server ne odgovori, NE diramo njegove monitore (da ne pauziramo sve greškom)
-            log(f"[greška] {s['name']}: {e} — preskačem ovaj server u ovom prolazu")
+            # If a server doesn't respond, DON'T touch its monitors (don't pause everything by mistake)
+            log(f"[error] {s['name']}: {e} — skipping this server in this run")
             s["failed"] = True
             continue
         n_cf = sum(1 for _, cf, _ in doms.values() if cf)
         by_t = Counter(t for _, _, t in doms.values())
-        log(f"{s['name']}: {len(doms)} domena za praćenje "
-            f"({', '.join(f'{k}={v}' for k, v in sorted(by_t.items()))}; {n_cf} na Cloudflare-u)")
+        log(f"{s['name']}: {len(doms)} domains to monitor "
+            f"({', '.join(f'{k}={v}' for k, v in sorted(by_t.items()))}; {n_cf} on Cloudflare)")
         for dom, (user, cf, dtype) in doms.items():
             desired.setdefault(dom, (s["name"], user, cf, dtype))
     failed = {s["name"] for s in servers if s.get("failed")}
 
-    # 2) istek domena (samo registrabilni domeni: main/addon, ne subdomeni)
+    # 2) domain expiry (registrable domains only: main/addon, not subdomains)
     expiry = {}
     if env_bool("DOMAIN_EXPIRY", "true"):
         reg = {}
@@ -783,16 +812,16 @@ def sync(dry=False):
         try:
             expiry = check_expiry(reg)
         except Exception as e:
-            log(f"[upozorenje] provera isteka domena nije uspela: {e}")
+            log(f"[warning] domain expiry check failed: {e}")
 
-    # 2b) SSL sertifikati (sync sam proverava, da bi alarmi išli na topic za istek)
+    # 2b) SSL certificates (checked by the sync so alerts go to the expiry topic)
     ssl_check = env_bool("SSL_CHECK", "true")
     ssl_info = {}
     if ssl_check:
         try:
             ssl_info = check_ssl({d: f"{u} ({s})" for d, (s, u, _, _) in desired.items()})
         except Exception as e:
-            log(f"[upozorenje] SSL provera nije uspela: {e}")
+            log(f"[warning] SSL check failed: {e}")
 
     on_removed = env("ON_REMOVED", "pause").lower()
     keyword = env("CONTENT_ERROR_KEYWORD", "Fatal error")
@@ -800,7 +829,7 @@ def sync(dry=False):
         "interval": env_int("MONITOR_INTERVAL", 300),
         "retryInterval": env_int("RETRY_INTERVAL", 60),
         "maxretries": env_int("MONITOR_RETRIES", 3),
-        # Kumin SSL alarm ide na iste notifikacije kao padovi — kad sync proverava SSL, gasimo ga
+        # Kuma's own SSL alert uses the same notifications as outages — off when the sync checks SSL
         "expiryNotification": not ssl_check,
     }
     if keyword:
@@ -810,9 +839,9 @@ def sync(dry=False):
     enforce = env_bool("ENFORCE_SETTINGS", "true")
 
     with connect_kuma() as api:
-        log("Kuma: login...")
+        log("Kuma: logging in...")
         api.login(env("KUMA_USER", required=True), env("KUMA_PASS", required=True))
-        log("Kuma: ulogovan, čitam tagove/notifikacije/monitore...")
+        log("Kuma: logged in, reading tags/notifications/monitors...")
 
         tag_id = get_tag_id(api, dry)
         cf_tag_id = get_tag_id(api, dry, CF_TAG_NAME, CF_TAG_COLOR)
@@ -830,14 +859,14 @@ def sync(dry=False):
         site_base["notificationIDList"] = site_notif
 
         monitors = api.get_monitors()
-        log(f"Kuma: {len(monitors)} postojećih monitora")
+        log(f"Kuma: {len(monitors)} existing monitors")
 
         groups = {s["name"]: ensure_group(api, GROUP_PREFIX + s["name"], monitors, dry)
                   for s in servers}
 
-        managed = {}        # host -> monitor (sajtovi)
-        infra_managed = {}  # key -> monitor (infrastruktura)
-        unmanaged = set()   # host-ovi koje već prati ručno napravljen monitor
+        managed = {}        # host -> monitor (sites)
+        infra_managed = {}  # key -> monitor (infrastructure)
+        unmanaged = set()   # hosts already covered by a hand-made monitor
         for m in monitors:
             if m["type"] == MonitorType.GROUP:
                 continue
@@ -855,7 +884,7 @@ def sync(dry=False):
 
         stats = Counter()
 
-        # 3) sajtovi: dodaj nove / ažuriraj postojeće
+        # 3) sites: add new / update existing
         for dom in sorted(desired):
             srv, user, on_cf, dtype = desired[dom]
             tag_value = f"{srv}/{user}"
@@ -865,22 +894,22 @@ def sync(dry=False):
             parts = []
             exp = expiry.get(dom)
             if exp:
-                parts.append(f"{EXPIRY_PREFIX} {exp:%d.%m.%Y} ({(exp - now).days} d)")
+                parts.append(f"{EXPIRY_PREFIX} {exp:{DATE_FMT}} ({(exp - now).days} d)")
             sexp, serr = ssl_info.get(dom, (None, None))
             if sexp:
-                parts.append(f"SSL ističe: {sexp:%d.%m.%Y} ({(sexp - now).days} d)")
+                parts.append(f"{SSL_EXPIRY_PREFIX} {sexp:{DATE_FMT}} ({(sexp - now).days} d)")
             elif serr and ssl_check:
                 parts.append(f"SSL: {serr[:80]}")
             if parts:
                 want["description"] = " · ".join(parts)
 
             if dom in unmanaged and dom not in managed:
-                continue  # već postoji ručni monitor, ne dupliramo
+                continue  # a hand-made monitor already exists, don't duplicate
 
             m = managed.get(dom)
             if m is None:
                 log(f"+ {dom}  ({tag_value}) [{dtype}]{'  [Cloudflare]' if on_cf else ''}")
-                stats["dodato"] += 1
+                stats["added"] += 1
                 if dry:
                     continue
                 res = api.add_monitor(
@@ -900,11 +929,11 @@ def sync(dry=False):
                 time.sleep(0.2)
                 continue
 
-            # postoji — grupa, server tag, podešavanja, tagovi, pauza
+            # exists — group, server tag, settings, tags, pause state
             old_tag = managed_tag(m)
             if m.get("parent") != parent or old_tag.get("value") != tag_value:
                 log(f"~ {dom}  {old_tag.get('value')} -> {tag_value}")
-                stats["premešteno"] += 1
+                stats["moved"] += 1
                 if not dry:
                     if m.get("parent") != parent:
                         api.edit_monitor(m["id"], parent=parent)
@@ -912,7 +941,7 @@ def sync(dry=False):
                     api.add_monitor_tag(tag_id=tag_id, monitor_id=m["id"], value=tag_value)
 
             if enforce:
-                # opis menjamo samo ako je prazan ili ga je pisao sync
+                # only touch the description if it's empty or was written by the sync
                 if "description" in want and (m.get("description") or "").strip() and \
                         not (m.get("description") or "").startswith(SYNC_DESC_PREFIXES):
                     want.pop("description")
@@ -920,19 +949,19 @@ def sync(dry=False):
                 if ch:
                     only_desc = set(ch) == {"description"}
                     if not only_desc:
-                        log(f"⚙ {dom}  podešavanja: {', '.join(sorted(ch))}")
-                    stats["opis" if only_desc else "podešeno"] += 1
+                        log(f"⚙ {dom}  settings: {', '.join(sorted(ch))}")
+                    stats["description" if only_desc else "updated"] += 1
                     if not dry:
                         api.edit_monitor(m["id"], **ch)
 
             has_cf = find_tag(m, CF_TAG_NAME)
             if on_cf and not has_cf:
-                log(f"☁ {dom}  sada iza Cloudflare-a, dodajem tag")
+                log(f"☁ {dom}  now behind Cloudflare, adding tag")
                 stats["cloudflare"] += 1
                 if not dry:
                     api.add_monitor_tag(tag_id=cf_tag_id, monitor_id=m["id"], value="")
             elif not on_cf and has_cf:
-                log(f"☁ {dom}  više nije iza Cloudflare-a, skidam tag")
+                log(f"☁ {dom}  no longer behind Cloudflare, removing tag")
                 stats["cloudflare"] += 1
                 if not dry:
                     api.delete_monitor_tag(tag_id=cf_tag_id, monitor_id=m["id"], value=has_cf.get("value", ""))
@@ -943,25 +972,25 @@ def sync(dry=False):
                     if not dry:
                         api.add_monitor_tag(tag_id=tid, monitor_id=m["id"], value="")
                 elif t != dtype and has_t:
-                    log(f"# {dom}  skidam tag {t}")
+                    log(f"# {dom}  removing tag {t}")
                     if not dry:
                         api.delete_monitor_tag(tag_id=tid, monitor_id=m["id"], value=has_t.get("value", ""))
             sync_resume(api, m, dom, stats, dry)
 
-        # 4) sajtovi kojih više nema
+        # 4) sites that are gone
         for dom, m in managed.items():
             if dom in desired:
                 continue
             srv = (managed_tag(m).get("value") or "").split("/")[0]
             if srv in failed:
-                continue  # server nije odgovorio, ne zaključujemo ništa
+                continue  # server didn't respond, conclude nothing
             if on_removed == "delete":
-                log(f"- {dom}  obrisan")
+                log(f"- {dom}  deleted")
             elif on_removed == "pause" and m.get("active", True):
-                log(f"⏸ {dom}  nije više za praćenje (nema ga na serveru ili DNS ne pokazuje kod nas), pauziram")
+                log(f"⏸ {dom}  out of scope (not on the server or DNS doesn't point to us), pausing")
             else:
                 continue
-            stats["uklonjeno"] += 1
+            stats["removed"] += 1
             if dry:
                 continue
             if on_removed == "delete":
@@ -969,7 +998,7 @@ def sync(dry=False):
             else:
                 sync_pause(api, m, pause_tag_id, dry)
 
-        # 5) infrastruktura
+        # 5) infrastructure
         infra = build_infra(servers)
         infra_groups = {g: ensure_group(api, g, monitors, dry) for g in {i["group"] for i in infra}}
         infra_keys = set()
@@ -1002,37 +1031,36 @@ def sync(dry=False):
             sync_resume(api, m, "infra  " + key, stats, dry)
         for key, m in infra_managed.items():
             if key not in infra_keys and m.get("active", True):
-                log(f"⏸ infra  {key}  (nije više u konfiguraciji)")
+                log(f"⏸ infra  {key}  (no longer in config)")
                 stats["infra-"] += 1
                 sync_pause(api, m, pause_tag_id, dry)
 
-    summary = ", ".join(f"{k}={v}" for k, v in sorted(stats.items())) or "bez promena"
-    log(f"gotovo{' (DRY RUN)' if dry else ''}: {summary}")
+    summary = ", ".join(f"{k}={v}" for k, v in sorted(stats.items())) or "no changes"
+    log(f"done{' (DRY RUN)' if dry else ''}: {summary}")
 
 
 def main():
     ap = argparse.ArgumentParser(description="cPanel -> Uptime Kuma sync")
-    ap.add_argument("--dry-run", action="store_true", help="samo prikaži promene")
-    ap.add_argument("--loop", action="store_true", help="ponavljaj na SYNC_INTERVAL sekundi")
-    ap.add_argument("--expiry", metavar="DOMEN", help="test: proveri kada ističe domen")
-    ap.add_argument("--test-ntfy", action="store_true", help="test: probna poruka na telefon")
-    ap.add_argument("--ssl", metavar="DOMEN", help="test: kada ističe SSL sertifikat")
+    ap.add_argument("--dry-run", action="store_true", help="only show what would change")
+    ap.add_argument("--loop", action="store_true", help="repeat every SYNC_INTERVAL seconds")
+    ap.add_argument("--expiry", metavar="DOMAIN", help="test: when does a domain expire")
+    ap.add_argument("--ssl", metavar="DOMAIN", help="test: when does an SSL certificate expire")
+    ap.add_argument("--test-ntfy", action="store_true", help="test: send a test message to the phone")
     args = ap.parse_args()
 
     if args.ssl:
         exp, err = get_cert(args.ssl.lower())
-        print(f"{args.ssl}: SSL ističe {exp:%d.%m.%Y}" if exp else f"{args.ssl}: {err}")
+        print(f"{args.ssl}: SSL expires {exp:{DATE_FMT}}" if exp else f"{args.ssl}: {err}")
         return
-
     if args.expiry:
         exp, src = lookup_expiry(args.expiry.lower())
-        print(f"{args.expiry}: {exp:%d.%m.%Y} (izvor: {src})" if exp
-              else f"{args.expiry}: datum nije pronađen (izvor: {src})")
+        print(f"{args.expiry}: {exp:{DATE_FMT}} (source: {src})" if exp
+              else f"{args.expiry}: date not found (source: {src})")
         return
     if args.test_ntfy:
         for var in ("NTFY_TOPIC_SITES", "NTFY_TOPIC_INFRA", "NTFY_TOPIC_EXPIRY"):
-            ntfy_send(env(var, ""), "Uptime Kuma test", f"Probna poruka ({var})", 3, ["test_tube"])
-            print(f"poslato na {var}={env(var, '') or '(prazno)'}")
+            ntfy_send(env(var, ""), "Uptime Kuma test", f"Test message ({var})", 3, ["test_tube"])
+            print(f"sent to {var}={env(var, '') or '(empty)'}")
         return
 
     if not args.loop:
@@ -1047,13 +1075,13 @@ def main():
             fails = 0
             wait = every
         except Exception as e:
-            # npr. Kuma setup još nije završen ili pogrešan user/pass — probaj ponovo uskoro
+            # e.g. Kuma setup not finished yet or wrong user/pass — retry soon
             fails += 1
-            log(f"[greška] sync nije uspeo: {type(e).__name__}: {e} — novi pokušaj za 2 min")
+            log(f"[error] sync failed: {type(e).__name__}: {e} — retrying in 2 min")
             traceback.print_exc()
             if fails == 3:
-                ntfy_send(env("NTFY_TOPIC_INFRA", ""), "kuma-sync ne radi",
-                          f"3 neuspela pokušaja zaredom.\n{type(e).__name__}: {e}", 4, ["warning"])
+                ntfy_send(env("NTFY_TOPIC_INFRA", ""), "kuma-sync is failing",
+                          f"3 failed attempts in a row.\n{type(e).__name__}: {e}", 4, ["warning"])
             wait = 120
         time.sleep(wait)
 

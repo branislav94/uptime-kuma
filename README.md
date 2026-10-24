@@ -1,70 +1,77 @@
 # uptime-kuma + cPanel sync
 
-Uptime Kuma 2 (embedded MariaDB) + `kuma-sync` kontejner koji automatski prati sve
-sajtove i infrastrukturu sa WHM/cPanel servera. Pokreće se kao Dockge stack
-(trenutno na TrueNAS-u: `/mnt/storage/stacks/uptime-kuma`).
+Uptime Kuma 2 (embedded MariaDB) plus a `kuma-sync` container that automatically
+monitors every site and the infrastructure of one or more WHM/cPanel servers.
+Runs as a Dockge stack.
 
-## Šta radi `kuma-sync`
+## What `kuma-sync` does
 
-**Sajtovi**
-- povlači domene sa svih WHM servera (`get_domain_info` + `listaccts`)
-- prati `main`, `addon`, `parked`, `sub`; preskače suspendovane naloge i pomoćne
-  subdomene koje cPanel pravi uz addon domene
-- prati samo domene čiji DNS stvarno pokazuje na naš server (ili Cloudflare)
-- grupa po serveru (`cPanel · cp1`), tagovi: `cpanel-sync` (server/korisnik),
+**Sites**
+- pulls domains from all WHM servers (`get_domain_info` + `listaccts`)
+- monitors `main`, `addon`, `parked` and `sub` domains; skips suspended accounts and the
+  helper subdomains cPanel creates for addon domains
+- only monitors domains whose DNS actually points to our server (or Cloudflare)
+- one group per server (`cPanel · cp1`); tags: `cpanel-sync` (server/user),
   `addon` / `sub` / `parked`, `Cloudflare`
-- keyword provera: sajt je dole i kad vrati 200, ali stranica sadrži `Fatal error`
-- domen preseljen na drugi server → monitor se sam premesti; domen nestao → pauza
-  sa tagom `auto-pauza`; kad se domen vrati, sync ga ponovo pokreće
-- **ručno pauzirane monitore sync nikad ne pokreće** (samo one sa tagom `auto-pauza`)
+- keyword check: a site is down even with HTTP 200 if the page contains `Fatal error`
+- domain moved to another server → the monitor follows; domain gone → paused with the
+  `auto-paused` tag, and resumed automatically when the domain comes back
+- **monitors you pause by hand are never resumed** (only those tagged `auto-paused`)
 
-**Infrastruktura** (grupa `Infrastruktura`)
-- za svaki WHM server: ping, WHM, cPanel, Webmail, SMTP 465/587, IMAPS, FTP
-- nameserveri (`NAMESERVERS`), dodatni monitori (`INFRA_EXTRA`, npr. Proxmox)
-- `Lokalna veza (Kuma)`: ping 1.1.1.1 / 8.8.8.8 — ako su dole, padovi su lažni
+**Infrastructure** (group `Infrastructure`)
+- for every WHM server: ping, WHM, cPanel, Webmail, SMTP 465/587, IMAPS, FTP
+- nameservers (`NAMESERVERS`), extra monitors (`INFRA_EXTRA`, e.g. Proxmox)
+- `Local uplink (Kuma)`: ping 1.1.1.1 / 8.8.8.8 — if these are down, outages are false alarms
 
-**Notifikacije** — ntfy (aplikacija na telefonu)
-- `NTFY_TOPIC_SITES` (prioritet 3/4), `NTFY_TOPIC_INFRA` (prioritet 5), `NTFY_TOPIC_EXPIRY`
-- poruka „kuma-sync ne radi" posle 3 neuspela sync-a
+**Notifications** — ntfy (phone app)
+- `NTFY_TOPIC_SITES` (priority 3/4), `NTFY_TOPIC_INFRA` (priority 5), `NTFY_TOPIC_EXPIRY`
+- a "kuma-sync is failing" message after 3 failed sync runs
 
-**Istek domena i SSL-a** — poseban ntfy kanal `NTFY_TOPIC_EXPIRY`
-- domeni: RDAP gde postoji, WHOIS za `.rs` / `.io` i ostale bez RDAP-a; alarm na 30/14/7/3/1 dan
-- SSL: sertifikat koji sajt stvarno servira; alarm na 14/7/3/1 dan (= AutoSSL ne uspeva da obnovi)
-- oba datuma u opisu monitora; stanje alarma u `sync-state/` (ne ponavljaju se posle restarta)
+**Domain and SSL expiry** — own ntfy topic `NTFY_TOPIC_EXPIRY`
+- domains: RDAP where available, WHOIS for `.rs` / `.io` and other TLDs without RDAP;
+  alerts at 30/14/7/3/1 days
+- SSL: the certificate the site actually serves; alerts at 14/7/3/1 days
+  (= AutoSSL is failing to renew)
+- both dates are shown in the monitor description; alert state lives in `sync-state/`
+  (no repeated alerts after a restart)
 
-## Postavljanje
+## Setup
 
 ```bash
-cd /mnt/storage/stacks
+cd /path/to/stacks
 git clone <repo> uptime-kuma && cd uptime-kuma
 cp .env.example .env && nano .env      # KUMA_*, WHM_SERVERS, NTFY_TOPIC_*
 docker compose up -d --build
 ```
 
-1. Otvori `http://<host>:3001`, izaberi **Embedded MariaDB**, napravi admin nalog (bez 2FA)
-2. Upiši `KUMA_USER` / `KUMA_PASS` u `.env`
+1. Open `http://<host>:3001`, choose **Embedded MariaDB**, create the admin account (no 2FA)
+2. Put `KUMA_USER` / `KUMA_PASS` into `.env`
 3. `docker compose up -d --force-recreate kuma-sync`
 
-WHM token: *WHM → Development → Manage API Tokens*, pravi se **na svakom serveru
-posebno**, pod `root`, ograničen na javnu IP Kuma hosta.
+WHM token: *WHM → Development → Manage API Tokens*. Create it **on each server
+separately**, as `root`, restricted to the public IP of the Kuma host.
 
-## Korisne komande
+## Useful commands
 
 ```bash
 docker compose logs -f kuma-sync                                  # log
-docker compose exec kuma-sync python kuma_sync.py --dry-run       # šta bi uradio
-docker compose exec kuma-sync python kuma_sync.py --test-ntfy     # probna poruka
-docker compose exec kuma-sync python kuma_sync.py --expiry x.rs   # istek domena
-docker compose exec kuma-sync python kuma_sync.py --ssl x.rs      # istek SSL-a
-docker compose up -d --build --force-recreate kuma-sync           # posle izmene skripte
-docker compose up -d --force-recreate kuma-sync                   # posle izmene .env
+docker compose exec kuma-sync python kuma_sync.py --dry-run       # what would change
+docker compose exec kuma-sync python kuma_sync.py --test-ntfy     # test message
+docker compose exec kuma-sync python kuma_sync.py --expiry x.rs   # domain expiry
+docker compose exec kuma-sync python kuma_sync.py --ssl x.rs      # SSL expiry
+docker compose up -d --build --force-recreate kuma-sync           # after changing the script
+docker compose up -d --force-recreate kuma-sync                   # after changing .env
 ```
 
-## Napomene
+## Notes
 
-- Kuma 2.x registruje `login` handler tek kad pošalje `loginRequired`; sync zato
-  čeka taj event pre logina (inače login tiho propadne i čeka timeout).
-- Sync menja samo monitore sa tagom `cpanel-sync`. Ručno napravljene ne dira i ne duplira.
-  Na svojim monitorima ne dira ručno dodate status kodove (npr. 503 za „coming soon").
-- `.rs` i `.io` nemaju RDAP u IANA bazi → Kumina ugrađena provera isteka za njih ne radi,
-  zato sync koristi WHOIS.
+- Kuma 2.x registers its `login` handler only after it emits `loginRequired`; the sync
+  waits for that event before logging in (otherwise the login is silently dropped and
+  the client waits for the timeout).
+- The sync only changes monitors tagged `cpanel-sync`. Hand-made monitors are never
+  touched or duplicated. On its own monitors it doesn't touch manually added status
+  codes (e.g. 503 for a "coming soon" page).
+- `.rs` and `.io` have no RDAP entry in the IANA bootstrap → Kuma's built-in domain
+  expiry check doesn't work for them, so the sync uses WHOIS.
+- Upgrading from the earlier Serbian version: groups, ntfy notifications and the
+  `auto-pauza` tag are renamed in place on the first run (nothing is duplicated).
