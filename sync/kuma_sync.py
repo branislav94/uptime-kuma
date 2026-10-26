@@ -4,13 +4,13 @@ kuma_sync.py — syncs WHM/cPanel servers into Uptime Kuma.
 
 Sites
 - Pulls domains via the WHM API (get_domain_info + listaccts) from one or more servers
-- One group per server ("cPanel · cp1"); monitors check status AND content (keyword)
+- Groups: Websites / <server> / <cPanel account>; monitors check status AND content (keyword)
 - Tags: cpanel-sync (server/user), addon/sub/parked, Cloudflare
 - Only monitors domains whose DNS actually points to our server (or Cloudflare)
 - Domain moved from cp2 to cp1 -> monitor is moved; domain gone -> paused
 
 Infrastructure
-- Nested groups: Infrastructure / cPanel servers / cp1, Infrastructure / Proxmox / Node102, ...
+- Nested groups: Infrastructure / cPanel / cp1, Infrastructure / Proxmox / Node102, Infrastructure / DNS, ...
 - cPanel servers (automatic from WHM_SERVERS): ping, WHM, cPanel, Webmail, mail/FTP ports
 - Proxmox nodes (PROXMOX_NODES): ping, Proxmox UI, optional ports
 - Per-host port overrides (INFRA_PORTS_<NAME>, PROXMOX_PORTS_<NAME>)
@@ -69,9 +69,10 @@ TYPE_TAGS = {
     "sub": "#0D9488",
     "parked": "#CA8A04",
 }
-GROUP_PREFIX = "cPanel · "
+SITES_GROUP = "Websites"          # Websites / <server> / <cPanel account>
+LEGACY_SITE_GROUP_PREFIX = "cPanel · "   # older versions: one flat top-level group per server
 INFRA_GROUP = "Infrastructure"
-CPANEL_SUBGROUP = "cPanel servers"
+CPANEL_SUBGROUP = "cPanel"
 PROXMOX_SUBGROUP = "Proxmox"
 DNS_SUBGROUP = "DNS"
 OTHER_SUBGROUP = "Other"
@@ -84,7 +85,8 @@ DATE_FMT = "%Y-%m-%d"
 
 # Names used by earlier (Serbian) versions — existing objects are renamed, not duplicated
 LEGACY_NAMES = {
-    INFRA_GROUP: ["Infrastruktura"],
+    INFRA_GROUP: ["Infrastruktura", "Servers"],
+    CPANEL_SUBGROUP: ["cPanel servers"],
     LOCAL_GROUP: ["Lokalna veza (Kuma)"],
     NTFY_SITES_NAME: ["ntfy · sajtovi"],
     NTFY_INFRA_NAME: ["ntfy · infrastruktura"],
@@ -655,9 +657,9 @@ def ensure_group(api, path, monitors, dry):
             if m["type"] == MonitorType.GROUP and m["name"] == name and (m.get("parent") or None) == parent:
                 gid = m["id"]
                 break
-        if gid is None and parent is None:
-            for m in monitors:  # rename a top-level group left over from an older version
-                if m["type"] == MonitorType.GROUP and not m.get("parent") \
+        if gid is None:
+            for m in monitors:  # rename a group left over from an older version (same parent)
+                if m["type"] == MonitorType.GROUP and (m.get("parent") or None) == parent \
                         and m["name"] in LEGACY_NAMES.get(name, []):
                     log(f"~ group {m['name']} -> {name}")
                     if not dry:
@@ -672,6 +674,38 @@ def ensure_group(api, path, monitors, dry):
                 monitors.append({"id": gid, "type": MonitorType.GROUP, "name": name, "parent": parent})
         parent = gid
     return parent
+
+
+def cleanup_empty_groups(api, dry):
+    """Delete groups the sync owns that ended up empty (client left a server, old layout).
+    Only touches groups below Websites/ and Infrastructure/ and old top-level "cPanel · x" groups."""
+    for _ in range(5):  # bottom-up, a few levels
+        ms = api.get_monitors()
+        by_id = {m["id"]: m for m in ms}
+        children = Counter(m.get("parent") for m in ms if m.get("parent"))
+
+        def root_of(m):
+            while m.get("parent") and m["parent"] in by_id:
+                m = by_id[m["parent"]]
+            return m
+
+        empty = []
+        for m in ms:
+            if m["type"] != MonitorType.GROUP or children.get(m["id"]):
+                continue
+            top = root_of(m)
+            owned_tree = top is not m and top["name"] in (SITES_GROUP, INFRA_GROUP)
+            legacy_flat = not m.get("parent") and m["name"].startswith(LEGACY_SITE_GROUP_PREFIX)
+            if owned_tree or legacy_flat:
+                empty.append(m)
+        if not empty:
+            return
+        for m in empty:
+            log(f"- empty group  {m['name']}")
+            if not dry:
+                api.delete_monitor(m["id"])
+        if dry:
+            return
 
 
 def ensure_ntfy(api, name, topic, priority, dry):
@@ -759,7 +793,7 @@ def build_infra(servers):
     def add_port(key, group, host, port):
         add(key, group, type=MonitorType.PORT, hostname=host, port=port)
 
-    # cPanel servers (from WHM_SERVERS): Infrastructure / cPanel servers / <server>
+    # cPanel servers (from WHM_SERVERS): Infrastructure / cPanel / <server>
     if env_bool("INFRA_AUTO", "true"):
         for s in servers:
             h, n = s["host"], s["name"]
@@ -913,8 +947,12 @@ def sync(dry=False):
         monitors = api.get_monitors()
         log(f"Kuma: {len(monitors)} existing monitors")
 
-        groups = {s["name"]: ensure_group(api, GROUP_PREFIX + s["name"], monitors, dry)
-                  for s in servers}
+        site_groups = {}  # (server, user) -> group id
+
+        def site_group(srv, user):
+            if (srv, user) not in site_groups:
+                site_groups[(srv, user)] = ensure_group(api, (SITES_GROUP, srv, user), monitors, dry)
+            return site_groups[(srv, user)]
 
         managed = {}        # host -> monitor (sites)
         infra_managed = {}  # key -> monitor (infrastructure)
@@ -940,7 +978,7 @@ def sync(dry=False):
         for dom in sorted(desired):
             srv, user, on_cf, dtype = desired[dom]
             tag_value = f"{srv}/{user}"
-            parent = groups.get(srv)
+            parent = site_group(srv, user)
             want = dict(site_base)
             now = datetime.now(timezone.utc)
             parts = []
@@ -983,14 +1021,16 @@ def sync(dry=False):
 
             # exists — group, server tag, settings, tags, pause state
             old_tag = managed_tag(m)
-            if m.get("parent") != parent or old_tag.get("value") != tag_value:
+            if old_tag.get("value") != tag_value:
                 log(f"~ {dom}  {old_tag.get('value')} -> {tag_value}")
                 stats["moved"] += 1
                 if not dry:
-                    if m.get("parent") != parent:
-                        api.edit_monitor(m["id"], parent=parent)
                     api.delete_monitor_tag(tag_id=tag_id, monitor_id=m["id"], value=old_tag.get("value", ""))
                     api.add_monitor_tag(tag_id=tag_id, monitor_id=m["id"], value=tag_value)
+            if m.get("parent") != parent:
+                stats["regrouped"] += 1
+                if not dry:
+                    api.edit_monitor(m["id"], parent=parent)
 
             if enforce:
                 # only touch the description if it's empty or was written by the sync
@@ -1033,7 +1073,14 @@ def sync(dry=False):
         for dom, m in managed.items():
             if dom in desired:
                 continue
-            srv = (managed_tag(m).get("value") or "").split("/")[0]
+            srv, _, user = (managed_tag(m).get("value") or "").partition("/")
+            # keep out-of-scope monitors in their client group too (so old groups can be cleaned up)
+            if srv and user and on_removed != "delete":
+                gid = site_group(srv, user)
+                if gid and m.get("parent") != gid:
+                    stats["regrouped"] += 1
+                    if not dry:
+                        api.edit_monitor(m["id"], parent=gid)
             if srv in failed:
                 continue  # server didn't respond, conclude nothing
             if on_removed == "delete":
@@ -1095,6 +1142,8 @@ def sync(dry=False):
                 log(f"⏸ infra  {key}  (no longer in config)")
                 stats["infra-"] += 1
                 sync_pause(api, m, pause_tag_id, dry)
+
+        cleanup_empty_groups(api, dry)
 
     summary = ", ".join(f"{k}={v}" for k, v in sorted(stats.items())) or "no changes"
     log(f"done{' (DRY RUN)' if dry else ''}: {summary}")

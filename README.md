@@ -11,8 +11,9 @@ Runs as a Dockge stack.
 - monitors `main`, `addon`, `parked` and `sub` domains; skips suspended accounts and the
   helper subdomains cPanel creates for addon domains
 - only monitors domains whose DNS actually points to our server (or Cloudflare)
-- one group per server (`cPanel · cp1`); tags: `cpanel-sync` (server/user),
-  `addon` / `sub` / `parked`, `Cloudflare`
+- groups: `Websites / <server> / <cPanel account>` (e.g. `Websites / cp1 / lartgroupe`);
+  tags: `cpanel-sync` (server/user), `addon` / `sub` / `parked`, `Cloudflare`
+- empty client groups (account removed or moved) are deleted automatically
 - keyword check: a site is down even with HTTP 200 if the page contains `Fatal error`
 - domain moved to another server → the monitor follows; domain gone → paused with the
   `auto-paused` tag, and resumed automatically when the domain comes back
@@ -21,7 +22,7 @@ Runs as a Dockge stack.
 **Infrastructure** — nested groups
 ```
 Infrastructure
-├── cPanel servers / cp1, cp2 …   ping, WHM, cPanel, Webmail, mail/FTP ports (from WHM_SERVERS)
+├── cPanel / cp1, cp2 …           ping, WHM, cPanel, Webmail, mail/FTP ports (from WHM_SERVERS)
 ├── Proxmox / Node102, Node103 …  ping, Proxmox UI (8006) + optional ports (PROXMOX_NODES)
 ├── DNS                           nameservers (NAMESERVERS)
 └── Other / your groups           INFRA_EXTRA, e.g. Game / Wings
@@ -80,5 +81,8 @@ docker compose up -d --force-recreate kuma-sync                   # after changi
   codes (e.g. 503 for a "coming soon" page).
 - `.rs` and `.io` have no RDAP entry in the IANA bootstrap → Kuma's built-in domain
   expiry check doesn't work for them, so the sync uses WHOIS.
-- Upgrading from the earlier Serbian version: groups, ntfy notifications and the
-  `auto-pauza` tag are renamed in place on the first run (nothing is duplicated).
+- Upgrading from older versions: groups, ntfy notifications and the `auto-pauza` tag
+  are renamed in place, monitors are moved into the new groups and the old empty groups
+  (`cPanel · cp1`, …) are deleted on the first run — history is kept, nothing is duplicated.
+- Empty groups below `Websites/` and `Infrastructure/` are treated as owned by the sync
+  and deleted — don't create your own empty groups there.
