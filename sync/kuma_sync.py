@@ -19,6 +19,11 @@ Infrastructure
 Notifications
 - ntfy (phone app): separate topics for sites and for infrastructure
 
+Status pages
+- public (services only: web hosting, email, DNS + chosen extras; no client sites, no nodes)
+- internal (everything — keep it behind NetBird / Cloudflare Access)
+- optional per-client pages (STATUS_CLIENT_PAGES)
+
 Domain and SSL expiry (separate ntfy topic NTFY_TOPIC_EXPIRY)
 - RDAP where available, WHOIS for .rs/.io and other TLDs without RDAP; alerts at 30/14/7/3/1 days
 - SSL certificate actually served by the site; alerts at 14/7/3/1 days (= AutoSSL is not renewing)
@@ -708,6 +713,152 @@ def cleanup_empty_groups(api, dry):
             return
 
 
+# --------------------------------------------------------- status pages ---
+
+STATUS_LABELS = {
+    "en": {"web": "Web hosting", "email": "Email", "dns": "DNS", "sites": "Websites",
+           "services": "Services", "uplink": "Monitoring uplink"},
+    "sr": {"web": "Web hosting", "email": "Email", "dns": "DNS", "sites": "Sajtovi",
+           "services": "Usluge", "uplink": "Monitoring veza"},
+}
+MAIL_PORTS = {25, 110, 143, 465, 587, 993, 995}
+
+
+def slugify(text):
+    return re.sub(r"[^a-z0-9-]+", "-", text.lower()).strip("-")[:60] or "page"
+
+
+def status_label(key):
+    lang = env("STATUS_LANG", "en").lower()
+    return STATUS_LABELS.get(lang, STATUS_LABELS["en"])[key]
+
+
+def ensure_status_page(api, slug, title, sections, dry, description="", domains=None, stats=None):
+    """Create/update a status page. sections: [(name, [monitor ids])]. Empty sections are dropped.
+    Saves only when something changed. Tags are never shown (they contain client usernames)."""
+    sections = [(n, ids) for n, ids in sections if ids]
+    want_groups = [(n, list(ids)) for n, ids in sections]
+    existing = {p["slug"]: p for p in api.get_status_pages()}
+    if slug not in existing:
+        log(f"+ status page  /status/{slug}  ({title})")
+        if stats is not None:
+            stats["status pages"] += 1
+        if dry:
+            return
+        api.add_status_page(slug, title)
+    else:
+        cur = api.get_status_page(slug)
+        cur_groups = [(g.get("name"), [m["id"] for m in g.get("monitorList") or []])
+                      for g in cur.get("publicGroupList") or []]
+        same = (cur_groups == want_groups and cur.get("title") == title
+                and (cur.get("description") or "") == (description or "")
+                and sorted(cur.get("domainNameList") or []) == sorted(domains or [])
+                and not cur.get("showTags"))
+        if same:
+            return
+        log(f"~ status page  /status/{slug}")
+        if stats is not None:
+            stats["status pages"] += 1
+        if dry:
+            return
+    kw = dict(
+        title=title,
+        description=description or None,
+        showTags=False,
+        showPoweredBy=False,
+        showCertificateExpiry=False,
+        publicGroupList=[{"name": n, "weight": i + 1, "monitorList": [{"id": x} for x in ids]}
+                         for i, (n, ids) in enumerate(want_groups)],
+    )
+    if domains:
+        kw["domainNameList"] = domains
+    if env("STATUS_FOOTER", ""):
+        kw["footerText"] = env("STATUS_FOOTER")
+    api.save_status_page(slug, **kw)
+
+
+def sync_status_pages(api, infra, dry, stats):
+    """Public page (services), internal page (everything) and optional per-client pages."""
+    if not env_bool("STATUS_PAGES", "true"):
+        return
+    ms = api.get_monitors()
+    by_id = {m["id"]: m for m in ms}
+    infra_ids, sites = {}, []      # key -> id ; [(server, user, name, id)]
+    for m in ms:
+        t = managed_tag(m)
+        if not t or m["type"] == MonitorType.GROUP:
+            continue
+        v = str(t.get("value", ""))
+        if v.startswith("infra:"):
+            infra_ids[v[6:]] = m["id"]
+        else:
+            srv, _, user = v.partition("/")
+            sites.append((srv, user, m["name"], m["id"]))
+    sites.sort()
+    infra_by_key = {i["key"]: i for i in infra}
+
+    # --- public: services only, no client sites, no nodes/IPs ---
+    slug = env("STATUS_PUBLIC_SLUG", "")
+    if slug:
+        web, email, dns = [], [], []
+        for key, item in infra_by_key.items():
+            mid = infra_ids.get(key)
+            g = item["group"]
+            if not mid or len(g) < 2:
+                continue
+            if g[1] == CPANEL_SUBGROUP:
+                if item.get("port") in MAIL_PORTS:
+                    email.append(mid)
+                elif key.endswith((" · cPanel", " · Webmail")) or item.get("port") == 21:
+                    web.append(mid)
+            elif g[1] == DNS_SUBGROUP:
+                dns.append(mid)
+        sections = [(status_label("web"), sorted(web)), (status_label("email"), sorted(email)),
+                    (status_label("dns"), sorted(dns))]
+        # STATUS_PUBLIC_EXTRA="Monitor name|Section;..."  (any monitor in Kuma, e.g. WHMCS, Pterodactyl)
+        extra = {}
+        names = {m["name"]: m["id"] for m in ms if m["type"] != MonitorType.GROUP}
+        for entry in env_list("STATUS_PUBLIC_EXTRA", "", sep=";"):
+            name, _, section = (x.strip() for x in entry.partition("|"))
+            if name not in names:
+                log(f"[warning] STATUS_PUBLIC_EXTRA: no monitor named {name!r}")
+                continue
+            extra.setdefault(section or status_label("services"), []).append(names[name])
+        sections += list(extra.items())
+        ensure_status_page(api, slugify(slug), env("STATUS_PUBLIC_TITLE", "Status"), sections, dry,
+                           description=env("STATUS_PUBLIC_DESCRIPTION", ""),
+                           domains=env_list("STATUS_PUBLIC_DOMAINS", ""), stats=stats)
+
+    # --- internal: every infra group + websites per server (keep it behind NetBird/Access!) ---
+    slug = env("STATUS_INTERNAL_SLUG", "")
+    if slug:
+        sections = {}
+        for key, item in sorted(infra_by_key.items()):
+            mid = infra_ids.get(key)
+            if mid:
+                g = item["group"]
+                name = " / ".join(g[1:]) if len(g) > 1 else status_label("uplink")
+                sections.setdefault(name, []).append(mid)
+        for srv, user, _, mid in sites:
+            sections.setdefault(f"{status_label('sites')} · {srv}", []).append(mid)
+        ensure_status_page(api, slugify(slug), env("STATUS_INTERNAL_TITLE", "Internal status"),
+                           sorted(sections.items(), key=lambda x: (x[0].startswith(status_label("sites")), x[0])),
+                           dry, stats=stats)
+
+    # --- per client (cPanel account): STATUS_CLIENT_PAGES=user1,user2 | all ---
+    wanted = env_list("STATUS_CLIENT_PAGES", "")
+    if wanted:
+        users = sorted({u for _, u, _, _ in sites})
+        if [w.lower() for w in wanted] != ["all"]:
+            users = [u for u in users if u in wanted]
+        tpl = env("STATUS_CLIENT_TITLE", "{user}")
+        for user in users:
+            ids = [mid for _, u, _, mid in sites if u == user and by_id[mid].get("active", True)]
+            ensure_status_page(api, slugify(env("STATUS_CLIENT_SLUG_PREFIX", "") + user),
+                               tpl.format(user=user), [(status_label("sites"), ids)], dry,
+                               description=env("STATUS_PUBLIC_DESCRIPTION", ""), stats=stats)
+
+
 def ensure_ntfy(api, name, topic, priority, dry):
     """Create/update an ntfy notification in Kuma. Returns its id or None."""
     if not topic:
@@ -1144,6 +1295,10 @@ def sync(dry=False):
                 sync_pause(api, m, pause_tag_id, dry)
 
         cleanup_empty_groups(api, dry)
+        try:
+            sync_status_pages(api, infra, dry, stats)
+        except Exception as e:
+            log(f"[warning] status pages: {type(e).__name__}: {e}")
 
     summary = ", ".join(f"{k}={v}" for k, v in sorted(stats.items())) or "no changes"
     log(f"done{' (DRY RUN)' if dry else ''}: {summary}")

@@ -31,6 +31,14 @@ Local uplink (Kuma)               ping 1.1.1.1 / 8.8.8.8 — if these are down, 
 - each category gets its own checks; per-host overrides: `INFRA_PORTS_<NAME>`, `PROXMOX_PORTS_<NAME>`
 - infra monitors removed from the config are paused (or deleted with `INFRA_ON_REMOVED=delete`)
 
+**Status pages** — maintained by the sync, updated when monitors change
+- **public** (`STATUS_PUBLIC_SLUG`): services only — Web hosting (cPanel, Webmail, FTP),
+  Email (SMTP/IMAP), DNS + chosen extras (`STATUS_PUBLIC_EXTRA`); a coarse location in the
+  description. No client sites, no node names, no IPs, tags are never shown.
+- **internal** (`STATUS_INTERNAL_SLUG`): every infrastructure group + all sites per server.
+  Kuma 2 status pages have no password, so keep it behind NetBird / Cloudflare Access.
+- **per client** (`STATUS_CLIENT_PAGES=user1,user2` or `all`): that account's sites only.
+
 **Notifications** — ntfy (phone app)
 - `NTFY_TOPIC_SITES` (priority 3/4), `NTFY_TOPIC_INFRA` (priority 5), `NTFY_TOPIC_EXPIRY`
 - a "kuma-sync is failing" message after 3 failed sync runs
@@ -58,6 +66,15 @@ docker compose up -d --build
 
 WHM token: *WHM → Development → Manage API Tokens*. Create it **on each server
 separately**, as `root`, restricted to the public IP of the Kuma host.
+
+## Exposing the public status page (cloudflared)
+
+Publishing Kuma through a tunnel also publishes its login page and API. Make only the
+status page paths public and put everything else behind Cloudflare Access:
+
+- public: `/status/*`, `/api/status-page/*`, `/api/badge/*`, `/assets/*`, `/upload/*`,
+  `/icon.svg`, `/favicon.ico`, `/manifest.json`
+- everything else (the dashboard, `/socket.io/*`, `/metrics`): Cloudflare Access
 
 ## Useful commands
 
