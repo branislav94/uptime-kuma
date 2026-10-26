@@ -10,7 +10,10 @@ Sites
 - Domain moved from cp2 to cp1 -> monitor is moved; domain gone -> paused
 
 Infrastructure
-- Automatically for every WHM server: WHM, cPanel, Webmail, mail/FTP ports, ping
+- Nested groups: Infrastructure / cPanel servers / cp1, Infrastructure / Proxmox / Node102, ...
+- cPanel servers (automatic from WHM_SERVERS): ping, WHM, cPanel, Webmail, mail/FTP ports
+- Proxmox nodes (PROXMOX_NODES): ping, Proxmox UI, optional ports
+- Per-host port overrides (INFRA_PORTS_<NAME>, PROXMOX_PORTS_<NAME>)
 - Nameservers (DNS monitor), extra monitors from INFRA_EXTRA, own uplink check
 
 Notifications
@@ -68,6 +71,10 @@ TYPE_TAGS = {
 }
 GROUP_PREFIX = "cPanel · "
 INFRA_GROUP = "Infrastructure"
+CPANEL_SUBGROUP = "cPanel servers"
+PROXMOX_SUBGROUP = "Proxmox"
+DNS_SUBGROUP = "DNS"
+OTHER_SUBGROUP = "Other"
 LOCAL_GROUP = "Local uplink (Kuma)"
 NTFY_SITES_NAME = "ntfy · sites"
 NTFY_INFRA_NAME = "ntfy · infrastructure"
@@ -635,23 +642,36 @@ def sync_resume(api, m, label, stats, dry):
     return True
 
 
-def ensure_group(api, group_name, monitors, dry):
-    for m in monitors:
-        if m["type"] == MonitorType.GROUP and m["name"] == group_name:
-            return m["id"]
-    for m in monitors:  # rename a group left over from an older version
-        if m["type"] == MonitorType.GROUP and m["name"] in LEGACY_NAMES.get(group_name, []):
-            log(f"~ group {m['name']} -> {group_name}")
+def ensure_group(api, path, monitors, dry):
+    """Make sure a (nested) group exists. path: "Name" or ("Parent", "Child", ...).
+    Groups are matched by name AND parent, so "cp1" under cPanel servers and under
+    another branch are different groups. Returns the id of the last group."""
+    if isinstance(path, str):
+        path = (path,)
+    parent = None
+    for name in path:
+        gid = None
+        for m in monitors:
+            if m["type"] == MonitorType.GROUP and m["name"] == name and (m.get("parent") or None) == parent:
+                gid = m["id"]
+                break
+        if gid is None and parent is None:
+            for m in monitors:  # rename a top-level group left over from an older version
+                if m["type"] == MonitorType.GROUP and not m.get("parent") \
+                        and m["name"] in LEGACY_NAMES.get(name, []):
+                    log(f"~ group {m['name']} -> {name}")
+                    if not dry:
+                        api.edit_monitor(m["id"], name=name)
+                    m["name"] = name
+                    gid = m["id"]
+                    break
+        if gid is None:
+            log(f"+ group  {' / '.join(path[:path.index(name) + 1])}")
             if not dry:
-                api.edit_monitor(m["id"], name=group_name)
-            m["name"] = group_name
-            return m["id"]
-    log(f"+ group  {group_name}")
-    if dry:
-        return None
-    gid = api.add_monitor(type=MonitorType.GROUP, name=group_name)["monitorID"]
-    monitors.append({"id": gid, "type": MonitorType.GROUP, "name": group_name})
-    return gid
+                gid = api.add_monitor(type=MonitorType.GROUP, name=name, parent=parent)["monitorID"]
+                monitors.append({"id": gid, "type": MonitorType.GROUP, "name": name, "parent": parent})
+        parent = gid
+    return parent
 
 
 def ensure_ntfy(api, name, topic, priority, dry):
@@ -716,65 +736,97 @@ def monitor_changes(m, want):
 
 # ----------------------------------------------------- infrastructure ---
 
+PORT_NAMES = {21: "FTP", 22: "SSH", 25: "SMTP 25", 465: "SMTP 465", 587: "SMTP 587",
+              110: "POP3", 995: "POP3S", 143: "IMAP", 993: "IMAPS", 3306: "MySQL",
+              8007: "PBS", 2087: "WHM", 2083: "cPanel", 2096: "Webmail"}
+
+
+def per_host_list(prefix, name, default):
+    """PREFIX_<NAME> overrides the generic setting for one server, e.g. INFRA_PORTS_CP2=465,993."""
+    key = prefix + "_" + re.sub(r"[^A-Z0-9]", "_", name.upper())
+    return env_list(key, env(prefix, default))
+
+
 def build_infra(servers):
-    """List of infrastructure monitors: {key, group, type, ...kuma fields}."""
+    """List of infrastructure monitors: {key, group (path tuple), type, ...kuma fields}."""
     items = []
     interval = env_int("INFRA_INTERVAL", 60)
 
     def add(key, group, **kw):
         kw.setdefault("interval", interval)
-        items.append({"key": key, "group": group, **kw})
+        items.append({"key": key, "group": tuple(group), **kw})
 
+    def add_port(key, group, host, port):
+        add(key, group, type=MonitorType.PORT, hostname=host, port=port)
+
+    # cPanel servers (from WHM_SERVERS): Infrastructure / cPanel servers / <server>
     if env_bool("INFRA_AUTO", "true"):
-        ports = [int(p) for p in env_list("INFRA_AUTO_PORTS", "465,587,993,21")]
-        port_names = {21: "FTP", 25: "SMTP 25", 465: "SMTP 465", 587: "SMTP 587",
-                      110: "POP3", 995: "POP3S", 143: "IMAP", 993: "IMAPS", 3306: "MySQL"}
         for s in servers:
             h, n = s["host"], s["name"]
-            add(f"{n} · ping", INFRA_GROUP, type=MonitorType.PING, hostname=h)
+            g = (INFRA_GROUP, CPANEL_SUBGROUP, n)
+            add(f"{n} · ping", g, type=MonitorType.PING, hostname=h)
             for label, port in (("WHM", 2087), ("cPanel", 2083), ("Webmail", 2096)):
-                add(f"{n} · {label}", INFRA_GROUP, type=MonitorType.HTTP,
+                add(f"{n} · {label}", g, type=MonitorType.HTTP,
                     url=f"https://{h}:{port}", accepted_statuscodes=["200-299", "300-399"])
-            for p in ports:
-                add(f"{n} · {port_names.get(p, f'port {p}')}", INFRA_GROUP,
-                    type=MonitorType.PORT, hostname=h, port=p)
+            for p in per_host_list("INFRA_PORTS", n, env("INFRA_AUTO_PORTS", "465,587,993,21")):
+                p = int(p)
+                add_port(f"{n} · {PORT_NAMES.get(p, f'port {p}')}", g, h, p)
 
+    # Proxmox nodes: PROXMOX_NODES="Node102|1.2.3.4,Node103|5.6.7.8"
+    #   Infrastructure / Proxmox / <node>: ping + Proxmox UI (8006) + PROXMOX_PORTS
+    for entry in env_list("PROXMOX_NODES", ""):
+        name, _, host = (x.strip() for x in entry.partition("|"))
+        if not host:
+            log(f"[warning] PROXMOX_NODES entry must be name|host: {entry!r}")
+            continue
+        g = (INFRA_GROUP, PROXMOX_SUBGROUP, name)
+        add(f"{name} · ping", g, type=MonitorType.PING, hostname=host)
+        add(f"{name} · Proxmox UI", g, type=MonitorType.HTTP, url=f"https://{host}:8006",
+            ignoreTls=True, accepted_statuscodes=["200-299", "300-399"])
+        for p in per_host_list("PROXMOX_PORTS", name, ""):
+            p = int(p)
+            add_port(f"{name} · {PORT_NAMES.get(p, f'port {p}')}", g, host, p)
+
+    # Nameservers: Infrastructure / DNS
     test_domain = env("DNS_TEST_DOMAIN", "")
     for ns in env_list("NAMESERVERS", ""):
         ips = sorted(resolve_a(ns))
         if not ips or not test_domain:
             log(f"[warning] nameserver {ns}: no IP or DNS_TEST_DOMAIN not set")
             continue
-        add(f"DNS · {ns}", INFRA_GROUP, type=MonitorType.DNS, hostname=test_domain,
+        add(f"DNS · {ns}", (INFRA_GROUP, DNS_SUBGROUP), type=MonitorType.DNS, hostname=test_domain,
             dns_resolve_server=ips[0], port=53, dns_resolve_type="A")
 
-    # INFRA_EXTRA="name|type|target;name|type|target"
+    # INFRA_EXTRA="name|type|target[|group/subgroup];..."
     #   type: http | http-insecure | port (host:port) | ping | dns (domain@resolver-ip)
+    #   group (optional): path under Infrastructure, e.g. "Game" or "Game/Wings"; default "Other"
     for item in env_list("INFRA_EXTRA", "", sep=";"):
         parts = [p.strip() for p in item.split("|")]
-        if len(parts) != 3:
-            log(f"[warning] INFRA_EXTRA entry must be name|type|target: {item!r}")
+        if len(parts) not in (3, 4):
+            log(f"[warning] INFRA_EXTRA entry must be name|type|target[|group]: {item!r}")
             continue
-        name, typ, target = parts
+        name, typ, target = parts[:3]
+        sub = [x.strip() for x in (parts[3] if len(parts) == 4 else OTHER_SUBGROUP).split("/") if x.strip()]
+        g = (INFRA_GROUP, *sub)
         typ = typ.lower()
         if typ in ("http", "http-insecure"):
-            add(name, INFRA_GROUP, type=MonitorType.HTTP, url=target,
+            add(name, g, type=MonitorType.HTTP, url=target,
                 ignoreTls=(typ == "http-insecure"), accepted_statuscodes=["200-299", "300-399"])
         elif typ == "port":
             h, _, p = target.rpartition(":")
-            add(name, INFRA_GROUP, type=MonitorType.PORT, hostname=h, port=int(p))
+            add_port(name, g, h, int(p))
         elif typ == "ping":
-            add(name, INFRA_GROUP, type=MonitorType.PING, hostname=target)
+            add(name, g, type=MonitorType.PING, hostname=target)
         elif typ == "dns":
             d, _, resolver = target.partition("@")
-            add(name, INFRA_GROUP, type=MonitorType.DNS, hostname=d,
+            add(name, g, type=MonitorType.DNS, hostname=d,
                 dns_resolve_server=resolver or "1.1.1.1", port=53, dns_resolve_type="A")
         else:
             log(f"[warning] INFRA_EXTRA unknown type {typ!r} for {name}")
 
     # own uplink: if these are down, site outages are probably false alarms
     for ip in env_list("INTERNET_CHECK", "1.1.1.1,8.8.8.8"):
-        add(f"Internet · {ip}", LOCAL_GROUP, type=MonitorType.PING, hostname=ip)
+        add(f"Internet · {ip}", (LOCAL_GROUP,), type=MonitorType.PING, hostname=ip)
     return items
 
 
@@ -1000,7 +1052,8 @@ def sync(dry=False):
 
         # 5) infrastructure
         infra = build_infra(servers)
-        infra_groups = {g: ensure_group(api, g, monitors, dry) for g in {i["group"] for i in infra}}
+        infra_groups = {g: ensure_group(api, g, monitors, dry)
+                        for g in sorted({i["group"] for i in infra})}
         infra_keys = set()
         for item in infra:
             key = item["key"]
@@ -1029,8 +1082,16 @@ def sync(dry=False):
                 if not dry:
                     api.edit_monitor(m["id"], **ch)
             sync_resume(api, m, "infra  " + key, stats, dry)
+        infra_removed = env("INFRA_ON_REMOVED", "pause").lower()
         for key, m in infra_managed.items():
-            if key not in infra_keys and m.get("active", True):
+            if key in infra_keys:
+                continue
+            if infra_removed == "delete":
+                log(f"- infra  {key}  (no longer in config, deleting)")
+                stats["infra-"] += 1
+                if not dry:
+                    api.delete_monitor(m["id"])
+            elif m.get("active", True):
                 log(f"⏸ infra  {key}  (no longer in config)")
                 stats["infra-"] += 1
                 sync_pause(api, m, pause_tag_id, dry)

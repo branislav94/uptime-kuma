@@ -18,10 +18,17 @@ Runs as a Dockge stack.
   `auto-paused` tag, and resumed automatically when the domain comes back
 - **monitors you pause by hand are never resumed** (only those tagged `auto-paused`)
 
-**Infrastructure** (group `Infrastructure`)
-- for every WHM server: ping, WHM, cPanel, Webmail, SMTP 465/587, IMAPS, FTP
-- nameservers (`NAMESERVERS`), extra monitors (`INFRA_EXTRA`, e.g. Proxmox)
-- `Local uplink (Kuma)`: ping 1.1.1.1 / 8.8.8.8 — if these are down, outages are false alarms
+**Infrastructure** — nested groups
+```
+Infrastructure
+├── cPanel servers / cp1, cp2 …   ping, WHM, cPanel, Webmail, mail/FTP ports (from WHM_SERVERS)
+├── Proxmox / Node102, Node103 …  ping, Proxmox UI (8006) + optional ports (PROXMOX_NODES)
+├── DNS                           nameservers (NAMESERVERS)
+└── Other / your groups           INFRA_EXTRA, e.g. Game / Wings
+Local uplink (Kuma)               ping 1.1.1.1 / 8.8.8.8 — if these are down, outages are false alarms
+```
+- each category gets its own checks; per-host overrides: `INFRA_PORTS_<NAME>`, `PROXMOX_PORTS_<NAME>`
+- infra monitors removed from the config are paused (or deleted with `INFRA_ON_REMOVED=delete`)
 
 **Notifications** — ntfy (phone app)
 - `NTFY_TOPIC_SITES` (priority 3/4), `NTFY_TOPIC_INFRA` (priority 5), `NTFY_TOPIC_EXPIRY`
