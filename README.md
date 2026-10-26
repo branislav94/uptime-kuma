@@ -35,8 +35,10 @@ Local uplink (Kuma)               ping 1.1.1.1 / 8.8.8.8 — if these are down, 
 - **public** (`STATUS_PUBLIC_SLUG`): services only — Web hosting (cPanel, Webmail, FTP),
   Email (SMTP/IMAP), DNS + chosen extras (`STATUS_PUBLIC_EXTRA`); a coarse location in the
   description. No client sites, no node names, no IPs, tags are never shown.
-- **internal** (`STATUS_INTERNAL_SLUG`): every infrastructure group + all sites per server.
-  Kuma 2 status pages have no password, so keep it behind NetBird / Cloudflare Access.
+- **internal infrastructure** (`STATUS_INTERNAL_SLUG`): every infrastructure group.
+- **internal client websites** (`STATUS_SITES_SLUG`): all sites, one section per client.
+  Kuma 2 status pages have no password, so keep both internal pages behind NetBird /
+  Cloudflare Access.
 - **per client** (`STATUS_CLIENT_PAGES=user1,user2` or `all`): that account's sites only.
 
 **Notifications** — ntfy (phone app)

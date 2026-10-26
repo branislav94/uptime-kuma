@@ -21,7 +21,8 @@ Notifications
 
 Status pages
 - public (services only: web hosting, email, DNS + chosen extras; no client sites, no nodes)
-- internal (everything — keep it behind NetBird / Cloudflare Access)
+- internal infrastructure + internal "Clients Websites" (one section per client)
+  — keep both behind NetBird / Cloudflare Access
 - optional per-client pages (STATUS_CLIENT_PAGES)
 
 Domain and SSL expiry (separate ntfy topic NTFY_TOPIC_EXPIRY)
@@ -829,7 +830,7 @@ def sync_status_pages(api, infra, dry, stats):
                            description=env("STATUS_PUBLIC_DESCRIPTION", ""),
                            domains=env_list("STATUS_PUBLIC_DOMAINS", ""), stats=stats)
 
-    # --- internal: every infra group + websites per server (keep it behind NetBird/Access!) ---
+    # --- internal infrastructure: every infra group (keep it behind NetBird/Access!) ---
     slug = env("STATUS_INTERNAL_SLUG", "")
     if slug:
         sections = {}
@@ -839,11 +840,17 @@ def sync_status_pages(api, infra, dry, stats):
                 g = item["group"]
                 name = " / ".join(g[1:]) if len(g) > 1 else status_label("uplink")
                 sections.setdefault(name, []).append(mid)
-        for srv, user, _, mid in sites:
-            sections.setdefault(f"{status_label('sites')} · {srv}", []).append(mid)
         ensure_status_page(api, slugify(slug), env("STATUS_INTERNAL_TITLE", "Internal status"),
-                           sorted(sections.items(), key=lambda x: (x[0].startswith(status_label("sites")), x[0])),
-                           dry, stats=stats)
+                           sorted(sections.items()), dry, stats=stats)
+
+    # --- internal client websites: one section per client (cPanel account) ---
+    slug = env("STATUS_SITES_SLUG", "")
+    if slug:
+        sections = {}
+        for srv, user, _, mid in sites:
+            sections.setdefault(f"{user} ({srv})", []).append(mid)
+        ensure_status_page(api, slugify(slug), env("STATUS_SITES_TITLE", "Clients Websites"),
+                           sorted(sections.items()), dry, stats=stats)
 
     # --- per client (cPanel account): STATUS_CLIENT_PAGES=user1,user2 | all ---
     wanted = env_list("STATUS_CLIENT_PAGES", "")
