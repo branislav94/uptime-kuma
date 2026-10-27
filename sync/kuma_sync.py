@@ -99,10 +99,15 @@ LEGACY_NAMES = {
     PAUSE_TAG_NAME: ["auto-pauza"],
 }
 # A description starting with one of these was written by the sync (safe to overwrite)
-SYNC_DESC_PREFIXES = (EXPIRY_PREFIX, SSL_EXPIRY_PREFIX, "SSL:",
+DNS_PROBLEM_TEXT = "DNS: domain does not resolve (NXDOMAIN) — expired domain or missing zone?"
+SYNC_DESC_PREFIXES = (EXPIRY_PREFIX, SSL_EXPIRY_PREFIX, "SSL:", "DNS:",
                       "Domen ističe:", "SSL ističe:")
 
 STATE_DIR = os.environ.get("STATE_DIR", "/app/state")
+
+# Domains that are on a server but don't resolve (filled in every run). They are NOT
+# paused — the site really is down for visitors, so Kuma keeps alerting.
+NXDOMAINS = set()
 
 
 # ------------------------------------------------------------- helpers ---
@@ -319,7 +324,11 @@ def fetch_domains(server):
             skipped["excluded"] += 1
             continue
         verdict, on_cf = dns_verdict(domain, server_ips)
-        if verdict != "ok":
+        if verdict == "nxdomain" and env("DNS_NXDOMAIN", "monitor").lower() != "pause":
+            # still ours, but broken DNS: keep monitoring so it shows as DOWN with a reason
+            NXDOMAINS.add(domain)
+            log(f"  DNS problem {domain} ({user}): does not resolve — keeping it monitored")
+        elif verdict != "ok":
             skipped["dns"] += 1
             log(f"  skipping {domain} ({user}): DNS {verdict}")
             continue
@@ -1026,6 +1035,7 @@ def build_infra(servers):
 
 def sync(dry=False):
     servers = parse_servers()
+    NXDOMAINS.clear()
 
     # 1) domains from all servers
     desired = {}  # domain -> (server, user, on_cloudflare, type)
@@ -1139,14 +1149,14 @@ def sync(dry=False):
             parent = site_group(srv, user)
             want = dict(site_base)
             now = datetime.now(timezone.utc)
-            parts = []
+            parts = [DNS_PROBLEM_TEXT] if dom in NXDOMAINS else []
             exp = expiry.get(dom)
             if exp:
                 parts.append(f"{EXPIRY_PREFIX} {exp:{DATE_FMT}} ({(exp - now).days} d)")
             sexp, serr = ssl_info.get(dom, (None, None))
             if sexp:
                 parts.append(f"{SSL_EXPIRY_PREFIX} {sexp:{DATE_FMT}} ({(sexp - now).days} d)")
-            elif serr and ssl_check:
+            elif serr and ssl_check and dom not in NXDOMAINS:
                 parts.append(f"SSL: {serr[:80]}")
             if parts:
                 want["description"] = " · ".join(parts)

@@ -15,8 +15,11 @@ Runs as a Dockge stack.
   tags: `cpanel-sync` (server/user), `addon` / `sub` / `parked`, `Cloudflare`
 - empty client groups (account removed or moved) are deleted automatically
 - keyword check: a site is down even with HTTP 200 if the page contains `Fatal error`
-- domain moved to another server → the monitor follows; domain gone → paused with the
-  `auto-paused` tag, and resumed automatically when the domain comes back
+- domain moved to another server → the monitor follows; domain gone (removed, account
+  suspended, or DNS now points to another host) → paused with the `auto-paused` tag, and
+  resumed automatically when the domain comes back
+- domain still on the server but **not resolving** (NXDOMAIN: expired domain, zone missing on
+  the nameservers) → stays monitored, Kuma alerts, the description says it's a DNS problem
 - **monitors you pause by hand are never resumed** (only those tagged `auto-paused`)
 
 **Infrastructure** — nested groups
