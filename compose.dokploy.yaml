@@ -1,0 +1,44 @@
+# Dokploy version of the stack.
+# In Dokploy: Compose service -> Provider: GitHub -> Compose Path: ./compose.dokploy.yaml
+#
+# Differences from compose.yaml (Dockge):
+# - named volumes: Dokploy re-clones the repo on every deploy, so bind mounts like ./data
+#   would live inside the clone; named volumes survive redeploys
+# - no host port: open Kuma through a Dokploy domain (Domains tab -> service uptime-kuma, port 3001)
+# - .env is written by Dokploy from the Environment tab (KUMA_URL is set here, don't add it there)
+
+services:
+  uptime-kuma:
+    image: louislam/uptime-kuma:2
+    restart: unless-stopped
+    expose:
+      - "3001"
+    volumes:
+      - kuma-data:/app/data
+    environment:
+      - TZ=Europe/Belgrade
+    healthcheck:
+      test: ["CMD-SHELL", "node extra/healthcheck.js || exit 1"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  kuma-sync:
+    build: ./sync
+    restart: unless-stopped
+    depends_on:
+      uptime-kuma:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      - KUMA_URL=http://uptime-kuma:3001
+      - TZ=Europe/Belgrade
+      - STATE_DIR=/app/state
+    volumes:
+      - kuma-sync-state:/app/state
+
+volumes:
+  kuma-data:
+  kuma-sync-state:

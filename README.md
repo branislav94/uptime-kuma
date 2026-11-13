@@ -72,6 +72,21 @@ docker compose up -d --build
 WHM token: *WHM → Development → Manage API Tokens*. Create it **on each server
 separately**, as `root`, restricted to the public IP of the Kuma host.
 
+## Deploying on Dokploy
+
+1. **Create → Compose**, provider **GitHub**, this repo, branch `main`,
+   **Compose Path: `./compose.dokploy.yaml`**
+2. **Environment** tab: paste the contents of your `.env` (everything from `.env.example`,
+   filled in). Don't add `KUMA_URL` — the compose file sets it.
+3. **Domains** tab: add a domain for service `uptime-kuma`, port `3001`, HTTPS on.
+4. **Deploy**, open the domain, choose **Embedded MariaDB**, create the admin account (no 2FA),
+   put it into `KUMA_USER` / `KUMA_PASS` in the Environment tab and **Redeploy**.
+5. WHM tokens: allow the **public IP of the Dokploy host** (`curl -s ifconfig.me` on it),
+   on every WHM server — otherwise WHM answers `403 Access denied`.
+
+Data lives in the named volumes `kuma-data` and `kuma-sync-state` and survives redeploys.
+Logs: service → **Logs** → `kuma-sync`.
+
 ## Exposing the public status page (cloudflared)
 
 Publishing Kuma through a tunnel also publishes its login page and API. Make only the
