@@ -4,15 +4,15 @@
 # Differences from compose.yaml (Dockge):
 # - named volumes: Dokploy re-clones the repo on every deploy, so bind mounts like ./data
 #   would live inside the clone; named volumes survive redeploys
-# - no host port: open Kuma through a Dokploy domain (Domains tab -> service uptime-kuma, port 3001)
+# - port 3001 is published as before (http://<host>:3001); a Dokploy domain is optional
 # - .env is written by Dokploy from the Environment tab (KUMA_URL is set here, don't add it there)
 
 services:
   uptime-kuma:
     image: louislam/uptime-kuma:2
     restart: unless-stopped
-    expose:
-      - "3001"
+    ports:
+      - "3001:3001"
     volumes:
       - kuma-data:/app/data
     environment:
