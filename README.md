@@ -1,5 +1,7 @@
 # uptime-kuma + cPanel sync
 
+**Docs:** [Operations guide](docs/GUIDE.md) · [Project history & open items](docs/HISTORY.md)
+
 Uptime Kuma 2 (embedded MariaDB) plus a `kuma-sync` container that automatically
 monitors every site and the infrastructure of one or more WHM/cPanel servers.
 Runs as a Dockge stack.
